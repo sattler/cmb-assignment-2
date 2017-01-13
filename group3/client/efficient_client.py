@@ -7,6 +7,7 @@ Our client implementation
 import socket
 import threading
 import time
+import struct
 
 from group3.constants import *
 
@@ -110,7 +111,7 @@ def client_thread(ip, fast, data_lock, connected_event, finish_event):
 
 def start_download(sock, data_lock, finish_event):
     while True:
-        buf = sock.recv(MSG_LENGTH + 2)
+        buf = sock.recv(MSG_LENGTH + 4)
 
         if len(buf) == 0:
             print 'connection error'
@@ -122,14 +123,18 @@ def start_download(sock, data_lock, finish_event):
         msg_len = MSG_LENGTH
         if offset + MSG_LENGTH > file_info[FileInfoKeys.FileSize]:
             msg_len = int(file_info[FileInfoKeys.FileSize]) - offset
-        while total_len < msg_len:
-            n_buf = sock.recv(MSG_LENGTH - total_len)
-            if len(n_buf) == 0:
-                if LOGGING:
-                    print 'connection error'
-                return
-            buf += n_buf
-            total_len += len(n_buf)
+
+        if total_len != msg_len:
+            continue
+
+        # while total_len < msg_len:
+        #     n_buf = sock.recv(MSG_LENGTH - total_len)
+        #     if len(n_buf) == 0:
+        #         if LOGGING:
+        #             print 'connection error'
+        #         return
+        #     buf += n_buf
+        #     total_len += len(n_buf)
 
         data[offset] = (buf, total_len)
         global written

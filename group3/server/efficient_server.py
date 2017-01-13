@@ -111,11 +111,24 @@ def send_file_data(serv_conn, file_info, thread_name):
         with file_infos_lock:
             send_offset = file_info[FileInfoKeys.NextToSend]
             file_info[FileInfoKeys.NextToSend] += MSG_LENGTH
+            while file_info[FileInfoKeys.NextToSend] in file_info[FileInfoKeys.OffsetsTrans]:
+                file_info[FileInfoKeys.OffsetsTrans].remove(file_info[FileInfoKeys.NextToSend])
+                file_info[FileInfoKeys.NextToSend] += MSG_LENGTH
 
         with file_info[FileInfoKeys.FileLock]:
             file_info[FileInfoKeys.FileObject].seek(send_offset, 0)
             data_to_send = file_info[FileInfoKeys.FileObject].read(MSG_LENGTH)
-            serv_conn.send(data_to_send)
+
+        send_length = 0
+        while send_length < MSG_LENGTH + 4:
+            send_length = serv_conn.send(struct.pack(send_offset) + data_to_send)
+            if send_length == 0:
+                with file_infos_lock:
+                    file_info[FileInfoKeys.NextToSend] = send_offset
+                return
+
+        with file_infos_lock:
+            file_info[FileInfoKeys.OffsetsTrans].append(send_offset)
 
 
 
