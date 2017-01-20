@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 
 import enum
+import logging
 
 PORT = 12345
 SERVER_IP_FAST = '10.1.0.3'
 SERVER_IP_SLOW = '10.0.0.3'
 HEARTBEAT_PORT = 23456
-LOGGING = False
+LOGGING = logging.DEBUG
 MAX_HEARTBEAT_SIZE = 1460
 
 TCP_KEEP_ALIVE_IDLE = 1
