@@ -2,7 +2,7 @@
 
 from distutils.core import setup
 
-install_requires = ['enum34>=1.1.6']
+install_requires = ['enum34>=1.1.6','ping>=0.2']
 
 
 setup(name='group3',

@@ -4,14 +4,15 @@
 Our client implementation
 """
 
-import socket
-import threading
-import os
-import time
-import struct
 import hashlib
+import os
+import socket
+import struct
+import threading
+import time
 import logging
 
+import group3.heartbeat as heartbeat
 from group3.constants import *
 
 file_infos = {}
@@ -40,17 +41,20 @@ def main():
     server_sock_slow.bind((SERVER_IP_SLOW, PORT))
     server_sock_slow.listen(1)
 
-    server_sock_fast.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    # Options specific for linux
-    server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEP_ALIVE_IDLE)
-    server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEP_ALIVE_INTERVALL)
-    server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEP_ALIVE_MAX_FAILS)
-
-    server_sock_slow.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    # Options specific for linux
-    server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEP_ALIVE_IDLE)
-    server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEP_ALIVE_INTERVALL)
-    server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEP_ALIVE_MAX_FAILS)
+    # TCP Keep Alive is to slow in recognizing a connection drop so we replaced it
+    # server_sock_fast.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    # # Options specific for linux
+    # server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEP_ALIVE_IDLE)
+    # server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,
+    # TCP_KEEP_ALIVE_INTERVALL)
+    # server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEP_ALIVE_MAX_FAILS)
+    #
+    # server_sock_slow.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    # # Options specific for linux
+    # server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEP_ALIVE_IDLE)
+    # server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,
+    # TCP_KEEP_ALIVE_INTERVALL)
+    # server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEP_ALIVE_MAX_FAILS)
 
     thread_fast = threading.Thread(target=server_thread, args=(server_sock_fast,),
                                    name='fast thread')
@@ -74,13 +78,28 @@ def setup_logger():
 
 def server_thread(serv_socket):
     logging.info('starting')
+
     try:
         while True:
             try:
                 logging.info('waiting for connection')
                 conn, addr = serv_socket.accept()
                 logging.info('{} connected'.format(addr))
-                first_msg = conn.recv(1024)
+
+                available_event = threading.Event()
+
+                def connection_status_changed(available):
+                    if available:
+                        available_event.set()
+                    else:
+                        available_event.clear()
+
+                heart_beat = heartbeat.Heartbeat(addr[0], action_handler=connection_status_changed,
+                                                 identifier='{} hearbeat'.format(addr[0]))
+
+                heart_beat.start()
+
+                first_msg = __recv_secure(conn, 1024, available_event)
 
                 if len(first_msg) == 0:
                     logging.info('{} disconnected'.format(addr))
@@ -94,22 +113,25 @@ def server_thread(serv_socket):
                     file_name = file_name.strip()
                     file_path = os.path.join(os.path.curdir, file_name)
                     if not os.path.exists(file_path):
-                        conn.send(ServerMsgs.FileErrorMsg + ' Path:' + file_path)
+                        __send_secure(conn, ServerMsgs.FileErrorMsg + ' Path:' + file_path,
+                                      available_event)
                         continue
 
                     file_size = os.path.getsize(file_path)
                     file_id = hashlib.sha256(file_path + str(time.time())).hexdigest()
                     with file_infos_lock:
-                        file_infos[file_id] = {FileInfoKeys.FileId: file_id,
-                                               FileInfoKeys.FileName: file_path,
-                                               FileInfoKeys.FileSize: file_size,
-                                               FileInfoKeys.FinishEvent: threading.Event(),
-                                               FileInfoKeys.NextToSend: 0,
-                                               FileInfoKeys.TransmittedOffsets: [],
-                                               FileInfoKeys.FileObject: open(file_path, 'rb', 4096),
-                                               FileInfoKeys.FileLock: threading.Lock()}
+                        file_infos[file_id] = {
+                            FileInfoKeys.FileId: file_id,
+                            FileInfoKeys.FileName: file_path,
+                            FileInfoKeys.FileSize: file_size,
+                            FileInfoKeys.FinishEvent: threading.Event(),
+                            FileInfoKeys.NextToSend: 0,
+                            FileInfoKeys.TransmittedOffsets: [],
+                            FileInfoKeys.FileObject: open(file_path, 'rb', 4096),
+                            FileInfoKeys.FileLock: threading.Lock()
+                            }
 
-                    data_sent = conn.send(str(file_size) + ',' + file_id)
+                    data_sent = __send_secure(conn, str(file_size) + ',' + file_id, available_event)
 
                     if data_sent == 0:
                         logging.warning('connection aborted')
@@ -117,13 +139,13 @@ def server_thread(serv_socket):
 
                     logging.debug('sent back fileId {}'.format(file_id))
 
-                    start_dl_msg = conn.recv(1024)
+                    start_dl_msg = __recv_secure(conn, 1024, available_event)
                     if len(start_dl_msg) == 0:
                         logging.warning('connection aborted')
                         continue
 
                     if ClientMsgs.StartDownload.value in start_dl_msg:
-                        send_file_data(conn, file_infos[file_id])
+                        send_file_data(conn, file_infos[file_id], available_event)
                     else:
                         logging.warning('start download msg was not as expected')
                         continue
@@ -134,7 +156,8 @@ def server_thread(serv_socket):
                     _, file_id = first_msg.split(',')
                     file_id = file_id.strip()
 
-                    if file_id not in file_infos:
+                    if file_id not in file_infos or \
+                            file_infos[file_id][FileInfoKeys.FinishEvent].is_set():
                         conn.send(ServerMsgs.FileErrorMsg.value + file_id + ' is not registered')
                         continue
 
@@ -143,10 +166,11 @@ def server_thread(serv_socket):
                     if send_length == 0:
                         logging.info('connection aborted')
 
-                    send_file_data(conn, file_infos[file_id])
+                    send_file_data(conn, file_infos[file_id], available_event)
             except socket.error:
                 logging.exception('')
             finally:
+                heart_beat.stop()
                 conn.close()
 
     finally:
@@ -154,23 +178,44 @@ def server_thread(serv_socket):
         serv_socket.close()
 
 
-def send_file_data(conn, file_info):
+def __recv_secure(socket, number_bytes, available_event):
+    if available_event.is_set:
+        return socket.recv(number_bytes)
+
+    return ''
+
+
+def __send_secure(socket, data, available_event):
+    if available_event.is_set:
+        return socket.send(data)
+
+    return None
+
+
+def send_file_data(conn, file_info, available_event):
     logging.debug('sending data')
     try:
-        while file_info[FileInfoKeys.NextToSend] >= 0 or not file_info[FileInfoKeys.FinishEvent].is_set():
+        while file_info[FileInfoKeys.NextToSend] >= 0 or not \
+                file_info[FileInfoKeys.FinishEvent].is_set():
+            if not available_event.is_set():
+                return
+
             if file_info[FileInfoKeys.NextToSend] < 0:
                 file_info[FileInfoKeys.FinishEvent].wait()
                 continue
             with file_infos_lock:
                 send_offset = file_info[FileInfoKeys.NextToSend]
 
-                if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
+                if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
+                        file_info[FileInfoKeys.FileSize]:
                     file_info[FileInfoKeys.NextToSend] = -1
                 else:
                     file_info[FileInfoKeys.NextToSend] += MSG_LENGTH
 
-                while file_info[FileInfoKeys.NextToSend] in file_info[FileInfoKeys.TransmittedOffsets]:
-                    if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
+                while file_info[FileInfoKeys.NextToSend] in \
+                        file_info[FileInfoKeys.TransmittedOffsets]:
+                    if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
+                            file_info[FileInfoKeys.FileSize]:
                         file_info[FileInfoKeys.NextToSend] = -1
                     else:
                         file_info[FileInfoKeys.NextToSend] += MSG_LENGTH
@@ -179,22 +224,30 @@ def send_file_data(conn, file_info):
                 file_info[FileInfoKeys.FileObject].seek(send_offset, 0)
                 data_to_send = file_info[FileInfoKeys.FileObject].read(MSG_LENGTH)
 
-            logging.debug('sending for offset {}'.format(send_offset))
+            send_length = __send_secure(conn, struct.pack('I', send_offset) + data_to_send,
+                                        available_event)
+            logging.debug('sent for offset {} length {}'.format(send_offset, send_length))
+            if send_length == 0:
+                with file_infos_lock:
+                    if send_offset + MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
+                        file_info[FileInfoKeys.FinishEvent].set()
+                        file_info[FileInfoKeys.FinishEvent].clear()
+                    file_info[FileInfoKeys.NextToSend] = send_offset
 
-            send_length = 0
-            while send_length < len(data_to_send) + 4:
-                send_length = conn.send(struct.pack('I', send_offset) + data_to_send)
-                if send_length == 0:
-                    with file_infos_lock:
-                        if file_info[FileInfoKeys.FinishEvent].is_set():
-                            file_info[FileInfoKeys.FinishEvent].set()
-                            file_info[FileInfoKeys.FinishEvent].clear()
-                        file_info[FileInfoKeys.NextToSend] = send_offset
+                logging.info('connection aborted for offset {}'.format(send_offset))
+                return
 
-                    logging.info('connection aborted for offset {}'.format(send_offset))
-                    return
+            if send_length < len(data_to_send) + 4:
+                with file_infos_lock:
+                    if send_offset + MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
+                        file_info[FileInfoKeys.FinishEvent].set()
+                        file_info[FileInfoKeys.FinishEvent].clear()
+                    file_info[FileInfoKeys.NextToSend] = send_offset
 
-            if send_length + send_offset >= file_info[FileInfoKeys.FileSize] and file_info[FileInfoKeys.NextToSend] < 0:
+                continue
+
+            if send_length + send_offset >= file_info[FileInfoKeys.FileSize] and \
+                    file_info[FileInfoKeys.NextToSend] < 0:
                 file_info[FileInfoKeys.FinishEvent].set()
 
             with file_infos_lock:
