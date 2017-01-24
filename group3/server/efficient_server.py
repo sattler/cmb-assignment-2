@@ -84,6 +84,7 @@ def server_thread(serv_socket):
             try:
                 logging.info('waiting for connection')
                 conn, addr = serv_socket.accept()
+                conn.settimeout(SOCKET_TIMEOUT)
                 logging.info('{} connected'.format(addr))
 
                 available_event = threading.Event()
@@ -99,13 +100,13 @@ def server_thread(serv_socket):
 
                 heart_beat.start()
 
-                first_msg = __recv_secure(conn, 1024, available_event)
+                first_msg = conn.recv(1024)
 
                 if len(first_msg) == 0:
                     logging.info('{} disconnected'.format(addr))
 
                 logging.debug('received first msg {}'.format(first_msg))
-
+                time.sleep(0.25)
                 if ClientMsgs.NewFile.value in first_msg:
                     logging.debug('first msg is new file')
 
@@ -131,9 +132,11 @@ def server_thread(serv_socket):
                             FileInfoKeys.FileLock: threading.Lock()
                             }
 
+                    # Wait timeout so that first ping at least is finished
+                    time.sleep(0.05)
                     data_sent = __send_secure(conn, str(file_size) + ',' + file_id, available_event)
 
-                    if data_sent == 0:
+                    if not data_sent:
                         logging.warning('connection aborted')
                         continue
 
@@ -179,14 +182,14 @@ def server_thread(serv_socket):
 
 
 def __recv_secure(socket, number_bytes, available_event):
-    if available_event.is_set:
+    if available_event.is_set():
         return socket.recv(number_bytes)
 
     return ''
 
 
 def __send_secure(socket, data, available_event):
-    if available_event.is_set:
+    if available_event.is_set():
         return socket.send(data)
 
     return None
@@ -224,10 +227,10 @@ def send_file_data(conn, file_info, available_event):
                 file_info[FileInfoKeys.FileObject].seek(send_offset, 0)
                 data_to_send = file_info[FileInfoKeys.FileObject].read(MSG_LENGTH)
 
-            send_length = __send_secure(conn, struct.pack('I', send_offset) + data_to_send,
+            send_length = __send_secure(conn, struct.pack('>i', send_offset) + data_to_send,
                                         available_event)
             logging.debug('sent for offset {} length {}'.format(send_offset, send_length))
-            if send_length == 0:
+            if not send_length:
                 with file_infos_lock:
                     if send_offset + MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
                         file_info[FileInfoKeys.FinishEvent].set()

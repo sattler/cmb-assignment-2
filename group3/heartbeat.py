@@ -2,7 +2,7 @@
 
 import logging
 import threading
-
+import time
 import ping
 
 
@@ -18,6 +18,7 @@ class Heartbeat(object):
         self.action_handler = action_handler
         self.connected = False
         self.identifier = identifier
+        self._counter = -1
         self._stop_event = threading.Event()
         self._run_event = threading.Event()
         self._heartbeat_thread = threading.Thread(target=Heartbeat._heartbeat,
@@ -34,6 +35,7 @@ class Heartbeat(object):
 
     @staticmethod
     def _heartbeat(self):
+        logging.debug('start pinging {}'.format(self.remote_host))
         while not self._stop_event.is_set():
             packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.2, count=1)
             result = True
@@ -41,6 +43,12 @@ class Heartbeat(object):
                 result = False
 
             if result != self.connected:
-                logging.debug('connetion status {}'.format(result))
-                self.action_handler(result)
-                self.connected = result
+                if self._counter >= 1 or self._counter == -1:
+                    logging.debug('connetion status {}'.format(result))
+                    self.action_handler(result)
+                    self.connected = result
+                    self._counter = 0
+                else:
+                    self._counter += 1
+
+            time.sleep(0.2)

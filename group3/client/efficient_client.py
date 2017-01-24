@@ -79,6 +79,7 @@ def client_thread(ip, connected_event, new_file_lock):
 
     while not finish_event.is_set():
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # client_sock.settimeout(SOCKET_TIMEOUT)
 
         # TCP Keep Alive is to slow in recognizing a connection drop so we replaced it
         # client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -91,6 +92,10 @@ def client_thread(ip, connected_event, new_file_lock):
 
             if not available_event.is_set():
                 available_event.wait()
+
+            if finish_event.is_set():
+                break
+
             client_sock.connect((ip, PORT))
 
             logging.debug('after connect')
@@ -150,7 +155,7 @@ def client_thread(ip, connected_event, new_file_lock):
                     file_size, file_id = response.split(',')
                     file_info[FileInfoKeys.FileId] = file_id
                     file_info[FileInfoKeys.FileSize] = int(file_size)
-                    logging.info('connected {} {}'.format(file_id, file_size))
+                    logging.info('connected {} {}'.format(file_id, file_info[FileInfoKeys.FileSize]))
 
                     connected_event.set()
 
@@ -168,7 +173,12 @@ def client_thread(ip, connected_event, new_file_lock):
                 if written >= file_info[FileInfoKeys.FileSize]:
                     logging.info('finished downloading')
 
-        except socket.error:
+        except socket.error as error:
+            if '111' in error.message:
+                logging.exception('server not started! Aborting...')
+                print('server not started! Aborting')
+                finish_event.set()
+                break
             logging.exception('client socket error')
         finally:
             client_sock.close()
@@ -188,7 +198,10 @@ def start_download(sock, available_event):
                 logging.warning('connection error')
                 return
 
-            offset = struct.unpack('I', buf[0:4])[0]
+            offset = struct.unpack('>i', buf[0:4])[0]
+            logging.debug('offset {}'.format(offset))
+            # print 'buf', buf[:4]
+            # print 'offset', offset
             buf = buf[4:]
             total_len = len(buf)
             msg_len = MSG_LENGTH
@@ -196,8 +209,14 @@ def start_download(sock, available_event):
             if offset + MSG_LENGTH > file_info[FileInfoKeys.FileSize]:
                 msg_len = int(file_info[FileInfoKeys.FileSize]) - offset
 
-            if total_len != msg_len:
-                continue
+            while total_len != msg_len:
+                buf += __recv_secure(sock, MSG_LENGTH - total_len, available_event)
+
+                if len(buf) == total_len:
+                    logging.warning('connection error')
+                    return
+
+                total_len = len(buf)
 
             data[offset] = (buf, total_len)
             logging.debug('received offset {}'.format(offset))
@@ -208,14 +227,14 @@ def start_download(sock, available_event):
 
 
 def __recv_secure(socket, number_bytes, available_event):
-    if available_event.is_set:
+    if available_event.is_set():
         return socket.recv(number_bytes)
 
     return ''
 
 
 def __send_secure(socket, data_to_send, available_event):
-    if available_event.is_set:
+    if available_event.is_set():
         return socket.send(data_to_send)
 
     return None
