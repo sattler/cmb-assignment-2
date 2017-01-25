@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 import ping
+import socket
 
 
 class Heartbeat(object):
@@ -38,7 +39,11 @@ class Heartbeat(object):
 def _heartbeat(self):
     logging.debug('start pinging {}'.format(self.remote_host))
     while not self._stop_event.is_set():
-        packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.2, count=1)
+        try:
+            packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.2, count=1)
+        except socket.error:
+            continue
+
         result = True
 
         if packets_lost:

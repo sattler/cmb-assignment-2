@@ -185,16 +185,16 @@ def server_thread(serv_socket):
         serv_socket.close()
 
 
-def __recv_secure(socket, number_bytes, available_event):
+def __recv_secure(sock, number_bytes, available_event):
     if available_event.is_set():
-        return socket.recv(number_bytes)
+        return sock.recv(number_bytes)
 
     return ''
 
 
-def __send_secure(socket, data, available_event):
+def __send_secure(sock, data, available_event):
     if available_event.is_set():
-        return socket.send(data)
+        return sock.send(data)
 
     return None
 
@@ -220,7 +220,8 @@ def send_file_data(conn, file_info, available_event):
 
                 if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
                         file_info[FileInfoKeys.FileSize]:
-                    to_send = set(file_info[FileInfoKeys.TransmittedOffsets]).difference(file_info[FileInfoKeys.AcknowledgedOffsets])
+                    to_send = set(file_info[FileInfoKeys.TransmittedOffsets]).difference(
+                        file_info[FileInfoKeys.AcknowledgedOffsets])
                     for offset in to_send:
                         file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
 
@@ -289,7 +290,6 @@ def rec_acks(conn, file_info, available_event, stop_event):
                     file_info[FileInfoKeys.AcknowledgedOffsets].append(ack)
     except socket.error:
         logging.exception('')
-
 
 
 if __name__ == '__main__':
