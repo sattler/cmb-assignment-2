@@ -22,6 +22,7 @@ class FileInfoKeys(enum.Enum):
 
 
 data = {}
+acks_sent = set()
 data_lock = threading.Lock()
 finish_event = threading.Event()
 written = 0
@@ -103,7 +104,7 @@ def client_thread(ip, connected_event, new_file_lock):
             if FileInfoKeys.FileId in file_info:
                 send_length = __send_secure(client_sock,
                                             ClientMsgs.Reconnect.value + ',' +
-                                                file_info[FileInfoKeys.FileId],
+                                            file_info[FileInfoKeys.FileId],
                                             available_event)
 
                 if send_length == 0:
@@ -155,7 +156,8 @@ def client_thread(ip, connected_event, new_file_lock):
                     file_size, file_id = response.split(',')
                     file_info[FileInfoKeys.FileId] = file_id
                     file_info[FileInfoKeys.FileSize] = int(file_size)
-                    logging.info('connected {} {}'.format(file_id, file_info[FileInfoKeys.FileSize]))
+                    logging.info('connected {} {}'.format(file_id,
+                                                          file_info[FileInfoKeys.FileSize]))
 
                     connected_event.set()
 
@@ -188,6 +190,11 @@ def client_thread(ip, connected_event, new_file_lock):
 
 def start_download(sock, available_event):
     logging.debug('downloading')
+    stop_event = threading.Event()
+    acknowledge_thred = threading.Thread(target=_send_acks, args=(sock, available_event,
+                                                                  stop_event))
+    acknowledge_thred.start()
+
     try:
         while not finish_event.is_set():
             if not available_event.is_set():
@@ -200,6 +207,11 @@ def start_download(sock, available_event):
 
             offset = struct.unpack('>i', buf[0:4])[0]
             logging.debug('offset {}'.format(offset))
+
+            if offset in acks_sent:
+                logging.debug('resend acks')
+                acks_sent.remove(offset)
+                continue
             # print 'buf', buf[:4]
             # print 'offset', offset
             buf = buf[4:]
@@ -221,21 +233,34 @@ def start_download(sock, available_event):
             data[offset] = (buf, total_len)
             logging.debug('received offset {}'.format(offset))
 
+    except socket.error:
+        logging.exception('')
+    finally:
+        stop_event.set()
 
+
+def _send_acks(conn, available_event, stop_event):
+    try:
+        while not stop_event.is_set():
+            to_send = set(data.keys()).difference(acks_sent)
+            for offset in to_send:
+                if not __send_secure(conn, str(offset), available_event):
+                    return
+                acks_sent.add(offset)
     except socket.error:
         logging.exception('')
 
 
-def __recv_secure(socket, number_bytes, available_event):
+def __recv_secure(sock, number_bytes, available_event):
     if available_event.is_set():
-        return socket.recv(number_bytes)
+        return sock.recv(number_bytes)
 
     return ''
 
 
-def __send_secure(socket, data_to_send, available_event):
+def __send_secure(sock, data_to_send, available_event):
     if available_event.is_set():
-        return socket.send(data_to_send)
+        return sock.send(data_to_send)
 
     return None
 

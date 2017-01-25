@@ -28,6 +28,7 @@ class FileInfoKeys(enum.Enum):
     TransmittedOffsets = 'offsets_trans'
     FileObject = 'file_obj'
     FileLock = 'lock'
+    AcknowledgedOffsets = 'acknowledged_offsets'
 
 
 def main():
@@ -96,7 +97,8 @@ def server_thread(serv_socket):
                         available_event.clear()
 
                 heart_beat = heartbeat.Heartbeat(addr[0], action_handler=connection_status_changed,
-                                                 identifier='{} hearbeat'.format(addr[0]))
+                                                 identifier='{} hearbeat'.format(addr[0]),
+                                                 min_wait_time=0.02)
 
                 heart_beat.start()
 
@@ -106,7 +108,7 @@ def server_thread(serv_socket):
                     logging.info('{} disconnected'.format(addr))
 
                 logging.debug('received first msg {}'.format(first_msg))
-                time.sleep(0.25)
+                time.sleep(0.02)
                 if ClientMsgs.NewFile.value in first_msg:
                     logging.debug('first msg is new file')
 
@@ -129,7 +131,8 @@ def server_thread(serv_socket):
                             FileInfoKeys.NextToSend: 0,
                             FileInfoKeys.TransmittedOffsets: [],
                             FileInfoKeys.FileObject: open(file_path, 'rb', 4096),
-                            FileInfoKeys.FileLock: threading.Lock()
+                            FileInfoKeys.FileLock: threading.Lock(),
+                            FileInfoKeys.AcknowledgedOffsets: []
                             }
 
                     # Wait timeout so that first ping at least is finished
@@ -169,6 +172,7 @@ def server_thread(serv_socket):
                     if send_length == 0:
                         logging.info('connection aborted')
 
+                    time.sleep(0.05)
                     send_file_data(conn, file_infos[file_id], available_event)
             except socket.error:
                 logging.exception('')
@@ -197,6 +201,11 @@ def __send_secure(socket, data, available_event):
 
 def send_file_data(conn, file_info, available_event):
     logging.debug('sending data')
+    stop_event = threading.Event()
+    acknowledge_thred = threading.Thread(target=rec_acks, args=(conn, file_info, available_event,
+                                                                stop_event))
+    acknowledge_thred.start()
+
     try:
         while file_info[FileInfoKeys.NextToSend] >= 0 or not \
                 file_info[FileInfoKeys.FinishEvent].is_set():
@@ -211,7 +220,11 @@ def send_file_data(conn, file_info, available_event):
 
                 if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
                         file_info[FileInfoKeys.FileSize]:
-                    file_info[FileInfoKeys.NextToSend] = -1
+                    to_send = set(file_info[FileInfoKeys.TransmittedOffsets]).difference(file_info[FileInfoKeys.AcknowledgedOffsets])
+                    for offset in to_send:
+                        file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
+
+                    file_info[FileInfoKeys.NextToSend] = min(to_send)
                 else:
                     file_info[FileInfoKeys.NextToSend] += MSG_LENGTH
 
@@ -260,6 +273,23 @@ def send_file_data(conn, file_info, available_event):
 
     except socket.error:
         logging.exception('')
+    finally:
+        stop_event.set()
+
+
+def rec_acks(conn, file_info, available_event, stop_event):
+    try:
+        while not stop_event.is_set():
+            ack = __recv_secure(conn, 1024, available_event)
+            if not ack:
+                return
+
+            if int(ack) not in file_info[FileInfoKeys.AcknowledgedOffsets]:
+                with file_infos_lock:
+                    file_info[FileInfoKeys.AcknowledgedOffsets].append(ack)
+    except socket.error:
+        logging.exception('')
+
 
 
 if __name__ == '__main__':
