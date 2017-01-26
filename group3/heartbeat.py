@@ -7,54 +7,51 @@ import ping
 import socket
 
 
-class Heartbeat(object):
+class Heartbeat(threading.Thread):
     """test the remote host with heartbeat requests"""
 
-    def __init__(self, remote_host, action_handler=None, identifier=None, min_wait_time=0.2):
+    def __init__(self, remote_host, available_event, identifier=None, min_wait_time=0.2):
         """
         init
         :param action_handler: a function which takes a AvailabilityStatus and returns nothing
         """
         self.remote_host = remote_host
-        self.action_handler = action_handler
-        self.connected = False
+        self.available_event = available_event
         self.identifier = identifier
         self._counter = -1
         self._stop_event = threading.Event()
-        self._run_event = threading.Event()
         self._min_wait_time = min_wait_time
-        self._heartbeat_thread = threading.Thread(target=_heartbeat,
-                                                  name='{}'.format(self.identifier),
-                                                  args=(self,))
-
-    def start(self):
-        """Starts with heartbeat"""
-        self._heartbeat_thread.start()
+        super(Heartbeat, self).__init__()
 
     def stop(self):
         """Stops the heartbeat"""
         self._stop_event.set()
 
 
-def _heartbeat(self):
-    logging.debug('start pinging {}'.format(self.remote_host))
-    while not self._stop_event.is_set():
-        try:
-            packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.5, count=1)
-        except socket.error:
-            continue
+    def run(self):
+        logging.debug('start pinging {}'.format(self.remote_host))
+        while not self._stop_event.is_set():
+            try:
+                packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.5, count=1)
+            except socket.error:
+                continue
 
-        result = True
+            result = True
 
-        if packets_lost:
-            result = False
+            if packets_lost:
+                result = False
 
-        if result != self.connected:
-            if self._counter >= 1 or self._counter == -1:
-                self.action_handler(result)
-                self.connected = result
-                self._counter = 0
+            if result != self.available_event.is_set():
+                if self._counter >= 2 or self._counter == -1:
+                    if result:
+                        self.available_event.set()
+                    else:
+                        self.available_event.clear()
+
+                    self._counter = 0
+                else:
+                    self._counter += 1
             else:
-                self._counter += 1
+                self._counter = 0
 
-        time.sleep(self._min_wait_time)
+            time.sleep(self._min_wait_time)

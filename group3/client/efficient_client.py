@@ -19,41 +19,49 @@ class FileInfoKeys(enum.Enum):
     FileId = 'file_id'
     FileSize = 'file_size'
     FileName = 'file_name'
+    Data = 'data'
+    DataLock = 'data_lock'
+    AcksSent = 'acks_sent'
+    AcksSentLock = 'acks_sent_lock'
+    FinishEvent = 'finish_event'
+    Written = 'written'
+    FileObj = 'file_obj'
+    FileLock = 'file_lock'
 
 
-data = {}
-acks_sent = set()
-acks_lock = threading.Lock()
-data_lock = threading.Lock()
-finish_event = threading.Event()
-written = 0
-file_info = {FileInfoKeys.FileName: 'index.html'}
-file_obj = open(os.path.join('downloads', file_info[FileInfoKeys.FileName]), 'wb')
+file_name = 'index.html'
 
 
 def main():
     setup_logger()
+
+    file_info = {
+        FileInfoKeys.FileName: file_name, FileInfoKeys.Data: {},
+        FileInfoKeys.DataLock: threading.Lock(), FileInfoKeys.AcksSent: set(),
+        FileInfoKeys.AcksSentLock: threading.Lock(), FileInfoKeys.FinishEvent: threading.Event(),
+        FileInfoKeys.Written: 0,
+        FileInfoKeys.FileObj: open(os.path.join('downloads', file_name), 'wb'),
+        FileInfoKeys.FileLock: threading.Lock()
+    }
+
     try:
         start_time = time.time()
-        connected_event = threading.Event()
-        new_file_lock = threading.Lock()
 
-        thread_fast = threading.Thread(target=client_thread, args=(SERVER_IP_FAST,
-                                                                   connected_event, new_file_lock),
-                                       name='fast')
-        thread_slow = threading.Thread(target=client_thread, args=(SERVER_IP_SLOW,
-                                                                   connected_event, new_file_lock),
-                                       name='slow')
-        thread_write = threading.Thread(target=write_thread, name='write thread')
+        connected_event = threading.Event()
+
+        fast_thread = ClientThread(SERVER_IP_FAST, file_info, connected_event, name='fast')
+        slow_thread = ClientThread(SERVER_IP_SLOW, file_info, connected_event, name='slow')
+
+        thread_write = WriteThread(file_info, name='write thread')
 
         thread_write.start()
-        thread_slow.start()
-        thread_fast.start()
+        slow_thread.start()
+        fast_thread.start()
 
-        thread_slow.join()
-        thread_fast.join()
+        slow_thread.join()
+        fast_thread.join()
     finally:
-        file_obj.close()
+        file_info[FileInfoKeys.FileObj].close()
 
         # TODO  measure how long it took
 
@@ -65,254 +73,271 @@ def setup_logger():
                         datefmt='%d.%m %H:%M:%S')
 
 
-def client_thread(ip, connected_event, new_file_lock):
-    available_event = threading.Event()
+class ClientThread(threading.Thread):
 
-    def connection_status_changed(available):
-        if available:
-            available_event.set()
-            logging.debug('available {}'.format(time.time()))
-        else:
-            available_event.clear()
-            logging.debug('not available {}'.format(time.time()))
+    def __init__(self, ip, file_info, connected_event, **kwargs):
+        self.ip = ip
+        self.file_info = file_info
+        self.connected_event = connected_event
+        self.available_event = threading.Event()
 
-    heart_beat = heartbeat.Heartbeat(ip, action_handler=connection_status_changed,
-                                     identifier='{} hearbeat'.format(ip))
+        super(ClientThread, self).__init__(**kwargs)
 
-    heart_beat.start()
+    def run(self):
+        heart_beat = heartbeat.Heartbeat(self.ip, available_event=self.available_event,
+                                         identifier='{} hearbeat'.format(self.ip))
 
-    while not finish_event.is_set():
-        client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_sock.settimeout(SOCKET_TIMEOUT)
+        heart_beat.start()
 
-        # TCP Keep Alive is to slow in recognizing a connection drop so we replaced it
-        # client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        # # Options specific for linux
-        # client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEP_ALIVE_IDLE)
-        # client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEP_ALIVE_INTERVALL)
-        # client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEP_ALIVE_MAX_FAILS)
+        while not self.file_info[FileInfoKeys.FinishEvent].is_set():
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_sock.settimeout(CLIENT_SOCKET_TIMEOUT)
 
-        try:
+            try:
 
-            if not available_event.is_set():
-                logging.debug('before wait')
-                available_event.wait()
-                logging.debug('after wait')
+                if not self.available_event.is_set():
+                    logging.debug('before wait')
+                    self.available_event.wait()
+                    logging.debug('after wait')
 
-            if finish_event.is_set():
-                break
+                if self.file_info[FileInfoKeys.FinishEvent].is_set():
+                    break
 
-            logging.debug('connecting')
+                logging.debug('connecting')
 
-            client_sock.connect((ip, PORT))
+                client_sock.connect((self.ip, PORT))
 
-            logging.debug('after connect')
+                logging.debug('after connect')
 
-            if FileInfoKeys.FileId in file_info:
-                send_length = __send_secure(client_sock,
-                                            ClientMsgs.Reconnect.value + ',' +
-                                            file_info[FileInfoKeys.FileId],
-                                            available_event)
-
-                if send_length == 0:
-                    logging.warning('server not present anymore')
-                    continue
-
-                logging.debug('reconnect msg sent')
-
-                response = __recv_secure(client_sock, 128, available_event)
-
-                if ServerMsgs.Acknowledge.value in response:
-                    logging.debug('reconnected')
-                    connected_event.set()
-                    start_download(client_sock, available_event)
-                else:
-                    logging.info('error occurred'.format(response))
-                    connected_event.set()
-                    return
-            else:
-                with new_file_lock:
-                    if FileInfoKeys.FileId in file_info:
-                        continue
-
-                    logging.debug('send newFile msg')
-
-                    send_length = __send_secure(client_sock, ClientMsgs.NewFile.value + ',' +
-                                                file_info[FileInfoKeys.FileName],
-                                                available_event)
+                if FileInfoKeys.FileId in self.file_info:
+                    send_length = _send_secure(client_sock,
+                                               ClientMsgs.Reconnect.value + ',' +
+                                               self.file_info[FileInfoKeys.FileId],
+                                               self.available_event)
 
                     if send_length == 0:
                         logging.warning('server not present anymore')
                         continue
 
-                    response = __recv_secure(client_sock, 128, available_event)
+                    logging.debug('reconnect msg sent')
 
-                    if len(response) == 0:
-                        logging.warning('connection aborted no response')
-                        continue
+                    response = _recv_secure(client_sock, 128, self.available_event)
 
-                    logging.debug('newFile msg response was: {}'.format(response))
-
-                    if ServerMsgs.FileErrorMsg.value in response:
-                        logging.error('Aborting! Serverresponse {}'.format(response))
-                        finish_event.set()
-                        connected_event.set()
+                    if ServerMsgs.Acknowledge.value in response:
+                        logging.debug('reconnected')
+                        self.connected_event.set()
+                        self.start_download(client_sock)
+                    else:
+                        logging.info('error occurred'.format(response))
+                        self.connected_event.set()
                         return
+                else:
+                    with self.file_info[FileInfoKeys.FileLock]:
+                        if FileInfoKeys.FileId in self.file_info:
+                            continue
 
-                    file_size, file_id = response.split(',')
-                    file_info[FileInfoKeys.FileId] = file_id
-                    file_info[FileInfoKeys.FileSize] = int(file_size)
-                    logging.info('connected {} {}'.format(file_id,
-                                                          file_info[FileInfoKeys.FileSize]))
+                        logging.debug('send newFile msg')
 
-                    connected_event.set()
+                        send_length = _send_secure(client_sock, ClientMsgs.NewFile.value + ',' +
+                                                   self.file_info[FileInfoKeys.FileName],
+                                                   self.available_event)
 
-                    bytes_sent = __send_secure(client_sock, ClientMsgs.StartDownload.value,
-                                               available_event)
-                    if bytes_sent != len(ClientMsgs.StartDownload.value):
-                        logging.info('start download connection error (sent: {}, of: {})'.format(
-                            bytes_sent, len(ClientMsgs.StartDownload.value)))
-                        # Probably not the best way to completely reconnect but the connection
-                        # has no
-                        # packet loss so it shouldn't be a Problem
-                        continue
+                        if send_length == 0:
+                            logging.warning('server not present anymore')
+                            continue
 
-                    start_download(client_sock, available_event)
+                        response = _recv_secure(client_sock, 128, self.available_event)
 
-                if written >= file_info[FileInfoKeys.FileSize]:
-                    while not __send_secure(client_sock, ClientMsgs.FinishedDownload.value, available_event):
-                        if not available_event.is_set():
-                            available_event.wait()
-                    logging.info('finished downloading')
+                        if len(response) == 0:
+                            logging.warning('connection aborted no response')
+                            continue
 
-        except socket.error as error:
-            if '111' in error.message:
-                logging.exception('server not started! Aborting...')
-                print('server not started! Aborting')
-                finish_event.set()
-                break
-            logging.exception('client socket error')
-        finally:
-            client_sock.close()
+                        logging.debug('newFile msg response was: {}'.format(response))
 
-    heart_beat.stop()
+                        if ServerMsgs.FileErrorMsg.value in response:
+                            logging.error('Aborting! Serverresponse {}'.format(response))
+                            self.file_info[FileInfoKeys.FinishEvent].set()
+                            self.connected_event.set()
+                            return
 
+                        file_size, file_id = response.split(',')
+                        self.file_info[FileInfoKeys.FileId] = file_id
+                        self.file_info[FileInfoKeys.FileSize] = int(file_size)
+                        logging.info('connected {} {}'.format(
+                            file_id, self.file_info[FileInfoKeys.FileSize]))
 
-def start_download(sock, available_event):
-    logging.debug('downloading')
-    stop_event = threading.Event()
-    acknowledge_thred = threading.Thread(target=_send_acks, args=(sock, available_event,
-                                                                  stop_event))
-    acknowledge_thred.daemon = True
-    acknowledge_thred.start()
+                        self.connected_event.set()
 
-    try:
-        while not finish_event.is_set():
-            if not available_event.is_set():
-                return
-            buf = __recv_secure(sock, MSG_LENGTH + 4, available_event)
+                        bytes_sent = _send_secure(client_sock, ClientMsgs.StartDownload.value,
+                                                  self.available_event)
 
-            if len(buf) == 0:
-                logging.warning('connection error')
-                return
+                        if bytes_sent != len(ClientMsgs.StartDownload.value):
+                            logging.info('start download connection error (sent: {}, of: {})'
+                                         .format(bytes_sent, len(ClientMsgs.StartDownload.value)))
+                            # Probably not the best way to completely reconnect but the connection
+                            # has no
+                            # packet loss so it shouldn't be a Problem
+                            continue
 
-            offset = struct.unpack('>I', buf[0:4])[0]
+                        self.start_download(client_sock)
 
-            if offset > file_info[FileInfoKeys.FileSize]:
-                logging.debug('received strange data! Resync needed, Aborting')
-                return
+                    if self.file_info[FileInfoKeys.Written] >= \
+                            self.file_info[FileInfoKeys.FileSize]:
+                        _send_secure(client_sock, ClientMsgs.FinishedDownload.value,
+                                     self.available_event)
+                        logging.info('finished downloading')
 
-            buf = buf[4:]
-            total_len = len(buf)
-            msg_len = MSG_LENGTH
+            except socket.error as error:
+                if '111' in error.message:
+                    logging.exception('server not started! Aborting...')
+                    print('server not started! Aborting')
+                    self.file_info[FileInfoKeys.FinishEvent].set()
+                    break
+                logging.exception('client socket error')
+            finally:
+                client_sock.close()
 
-            if offset + MSG_LENGTH > file_info[FileInfoKeys.FileSize]:
-                msg_len = int(file_info[FileInfoKeys.FileSize]) - offset
+        heart_beat.stop()
 
-            while total_len != msg_len:
-                buf += __recv_secure(sock, MSG_LENGTH - total_len, available_event)
+    def start_download(self, sock):
+        logging.debug('downloading')
+        stop_event = threading.Event()
 
-                if len(buf) == total_len:
+        acknowledge_thred = AcksThread(sock.getpeername()[0], self.available_event, self.file_info, stop_event)
+        acknowledge_thred.start()
+
+        try:
+            while not self.file_info[FileInfoKeys.FinishEvent].is_set():
+                if not self.available_event.is_set():
+                    return
+                buf = _recv_secure(sock, MSG_LENGTH + 4, self.available_event)
+
+                if len(buf) == 0:
                     logging.warning('connection error')
                     return
 
+                offset = struct.unpack('>I', buf[0:4])[0]
+
+                if offset > self.file_info[FileInfoKeys.FileSize]:
+                    logging.debug('received strange data! Resync needed, Aborting')
+                    return
+
+                buf = buf[4:]
                 total_len = len(buf)
+                msg_len = MSG_LENGTH
 
-            if offset in acks_sent:
-                with acks_lock:
-                    acks_sent.remove(offset)
-                continue
+                if offset + MSG_LENGTH > self.file_info[FileInfoKeys.FileSize]:
+                    msg_len = int(self.file_info[FileInfoKeys.FileSize]) - offset
 
-            data[offset] = (buf, total_len)
-            # logging.debug('received offset {}'.format(offset))
+                while total_len != msg_len:
+                    buf += _recv_secure(sock, MSG_LENGTH - total_len, self.available_event)
 
-    except socket.error:
-        logging.exception('')
-    finally:
-        stop_event.set()
-
-
-def _send_acks(conn, available_event, stop_event):
-    try:
-        while not stop_event.is_set():
-            to_send = set(data.keys()).difference(acks_sent)
-            data_to_send = ""
-            sent_acks = []
-            for offset in to_send:
-                data_to_send += struct.pack('>I', offset)
-                sent_acks.append(offset)
-
-                if len(data_to_send) >= 15 * 4:
-                    if not __send_secure(conn, data_to_send, available_event):
+                    if len(buf) == total_len:
+                        logging.warning('connection error')
                         return
+
+                    total_len = len(buf)
+
+                if offset in self.file_info[FileInfoKeys.AcksSent]:
+                    with self.file_info[FileInfoKeys.AcksSentLock]:
+                        self.file_info[FileInfoKeys.AcksSent].remove(offset)
+                    continue
+
+                self.file_info[FileInfoKeys.Data][offset] = (buf, total_len)
+                # logging.debug('received offset {}'.format(offset))
+
+        except socket.error:
+            logging.exception('')
+        finally:
+            stop_event.set()
+
+
+class AcksThread(threading.Thread):
+
+    def __init__(self, ip, available_event, file_info, stop_event, **kwargs):
+        self.ip = ip
+        self.available_event = available_event
+        self.file_info = file_info
+        self.stop_event = stop_event
+        super(AcksThread, self).__init__(**kwargs)
+
+    def _send_acks(self):
+        while not self.stop_event.is_set():
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            conn.connect((self.ip, ACKS_PORT))
+            try:
+                while not self.stop_event.is_set():
+                    to_send = set(self.file_info[FileInfoKeys.Data].keys()).difference(
+                        self.file_info[FileInfoKeys.AcksSent])
                     data_to_send = ""
-
-                    with acks_lock:
-                        for ack in sent_acks:
-                            acks_sent.add(ack)
-
                     sent_acks = []
+                    for offset in to_send:
+                        data_to_send += struct.pack('>I', offset)
+                        sent_acks.append(offset)
 
-            time.sleep(0.1)
+                        if len(data_to_send) >= 15 * 4:
+                            if not _send_secure(conn, data_to_send, self.available_event):
+                                return
+                            data_to_send = ""
 
-    except socket.error:
-        logging.exception('')
+                            with self.file_info[FileInfoKeys.AcksSentLock]:
+                                for ack in sent_acks:
+                                    self.file_info[FileInfoKeys.AcksSent].add(ack)
+
+                            sent_acks = []
+
+                    time.sleep(0.1)
+
+            except socket.error:
+                logging.exception('')
+            finally:
+                conn.close()
 
 
-def __recv_secure(sock, number_bytes, available_event):
+def _recv_secure(sock, number_bytes, available_event):
     if available_event.is_set():
         return sock.recv(number_bytes)
 
     return ''
 
 
-def __send_secure(sock, data_to_send, available_event):
+def _send_secure(sock, data_to_send, available_event):
     if available_event.is_set():
         return sock.send(data_to_send)
 
     return None
 
 
-def write_thread():
-    global written
-    while True:
-        if written in data:
-            while written < int(file_info[FileInfoKeys.FileSize]):
-                write_len = data[written][1]
-                file_obj.write(data[written][0])
+class WriteThread(threading.Thread):
 
-                # with data_lock:
-                #     del data[written]
+    def __init__(self, file_info, **kwargs):
+        self.file_info = file_info
+        super(WriteThread, self).__init__(**kwargs)
 
-                written += write_len
-                if written not in data:
-                    break
-            logging.debug('written {}'.format(written))
-            if written >= file_info[FileInfoKeys.FileSize]:
-                finish_event.set()
-                return
+    def run(self):
+        while True:
+            if self.file_info[FileInfoKeys.Written] in self.file_info[FileInfoKeys.Data]:
+                while self.file_info[FileInfoKeys.Written] < \
+                        int(self.file_info[FileInfoKeys.FileSize]):
+                    write_len = self.file_info[FileInfoKeys.Data][
+                        self.file_info[FileInfoKeys.Written]][1]
+                    self.file_info[FileInfoKeys.FileObj].write(
+                        self.file_info[FileInfoKeys.Data][self.file_info[FileInfoKeys.Written]][0])
 
-        time.sleep(0.05)
+                    # with data_lock:
+                    #     del data[written]
+
+                    self.file_info[FileInfoKeys.Written] += write_len
+                    if self.file_info[FileInfoKeys.Written] not in \
+                            self.file_info[FileInfoKeys.Data]:
+                        break
+                logging.debug('written {}'.format(self.file_info[FileInfoKeys.Written]))
+                if self.file_info[FileInfoKeys.Written] >= self.file_info[FileInfoKeys.FileSize]:
+                    self.file_info[FileInfoKeys.FinishEvent].set()
+                    return
+
+            time.sleep(0.05)
 
 
 if __name__ == '__main__':

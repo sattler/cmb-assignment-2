@@ -90,13 +90,7 @@ def server_thread(serv_socket):
 
                 available_event = threading.Event()
 
-                def connection_status_changed(available):
-                    if available:
-                        available_event.set()
-                    else:
-                        available_event.clear()
-
-                heart_beat = heartbeat.Heartbeat(addr[0], action_handler=connection_status_changed,
+                heart_beat = heartbeat.Heartbeat(addr[0], available_event=available_event,
                                                  identifier='{} hearbeat'.format(addr[0]),
                                                  min_wait_time=0.02)
 
@@ -137,7 +131,7 @@ def server_thread(serv_socket):
                             }
 
                     # Wait timeout so that first ping at least is finished
-                    time.sleep(0.05)
+                    time.sleep(0.02)
                     data_sent = __send_secure(conn, str(file_size) + ',' + file_id, available_event)
 
                     if not data_sent:
@@ -173,6 +167,7 @@ def server_thread(serv_socket):
                     if send_length == 0:
                         logging.info('connection aborted')
 
+                    time.sleep(0.02)
                     send_file_data(conn, file_infos[file_id], available_event)
             except socket.error:
                 logging.exception('')
@@ -202,9 +197,8 @@ def __send_secure(sock, data, available_event):
 def send_file_data(conn, file_info, available_event):
     logging.debug('sending data')
     stop_event = threading.Event()
-    acknowledge_thred = threading.Thread(target=rec_acks, args=(conn, file_info, available_event,
-                                                                stop_event, file_info[FileInfoKeys.FinishEvent]))
-    acknowledge_thred.daemon = True
+    acknowledge_thred = threading.Thread(target=rec_acks, args=(
+        conn.getsockname()[0], file_info, available_event, stop_event, file_info[FileInfoKeys.FinishEvent]))
     acknowledge_thred.start()
 
     try:
@@ -213,20 +207,29 @@ def send_file_data(conn, file_info, available_event):
             if not available_event.is_set():
                 return
 
+            if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
+                    file_info[FileInfoKeys.FileSize] or file_info[FileInfoKeys.NextToSend] < 0:
+                to_send = set(file_info[FileInfoKeys.TransmittedOffsets]).difference(
+                    file_info[FileInfoKeys.AcknowledgedOffsets])
+                with file_infos_lock:
+                    for offset in to_send:
+                        file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
+
+                if len(to_send) > 0:
+                    file_info[FileInfoKeys.NextToSend] = min(to_send)
+                else:
+                    file_info[FileInfoKeys.NextToSend] = -1
+
             if file_info[FileInfoKeys.NextToSend] < 0:
                 file_info[FileInfoKeys.FinishEvent].wait()
                 continue
+
             with file_infos_lock:
                 send_offset = file_info[FileInfoKeys.NextToSend]
 
                 if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
                         file_info[FileInfoKeys.FileSize]:
-                    to_send = set(file_info[FileInfoKeys.TransmittedOffsets]).difference(
-                        file_info[FileInfoKeys.AcknowledgedOffsets])
-                    for offset in to_send:
-                        file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
-
-                    file_info[FileInfoKeys.NextToSend] = min(to_send)
+                    file_info[FileInfoKeys.NextToSend] = -1
                 else:
                     file_info[FileInfoKeys.NextToSend] += MSG_LENGTH
 
@@ -282,31 +285,44 @@ def send_file_data(conn, file_info, available_event):
         stop_event.set()
 
 
-def rec_acks(conn, file_info, available_event, stop_event, finish_event):
-    try:
-        while not stop_event.is_set():
-            ack = __recv_secure(conn, 64, available_event)
+def rec_acks(ip, file_info, available_event, stop_event, finish_event):
+    while not stop_event.is_set():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-            if not ack:
-                return
+            sock.bind((ip, ACKS_PORT))
+            sock.listen(1)
 
-            if ClientMsgs.FinishedDownload.value in ack:
-                finish_event.set()
-                return
+            conn, addr = sock.accept()
 
-            if len(ack) % 4 != 0:
-                ack = ack[:(len(ack) // 4)*4]
+            while not stop_event.is_set():
 
-            ack_offsets = struct.unpack('>{}I'.format(len(ack)/4), ack)
 
-            logging.debug('recv ack {}'.format(ack_offsets))
-            for ack in ack_offsets:
-                if ack not in file_info[FileInfoKeys.AcknowledgedOffsets]:
-                    with file_infos_lock:
-                        file_info[FileInfoKeys.AcknowledgedOffsets].append(ack)
+                ack = __recv_secure(conn, 64, available_event)
 
-    except socket.error:
-        logging.exception('')
+                if not ack:
+                    return
+
+                if ClientMsgs.FinishedDownload.value in ack:
+                    finish_event.set()
+                    return
+
+                if len(ack) % 4 != 0:
+                    ack = ack[:(len(ack) // 4)*4]
+
+                ack_offsets = struct.unpack('>{}I'.format(len(ack)/4), ack)
+
+                logging.debug('recv ack {}'.format(ack_offsets))
+                for ack in ack_offsets:
+                    if ack not in file_info[FileInfoKeys.AcknowledgedOffsets]:
+                        with file_infos_lock:
+                            file_info[FileInfoKeys.AcknowledgedOffsets].append(ack)
+
+        except socket.error:
+            logging.exception('')
+        finally:
+            conn.close()
+            sock.close()
 
 
 if __name__ == '__main__':
