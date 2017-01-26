@@ -23,6 +23,7 @@ class FileInfoKeys(enum.Enum):
 
 data = {}
 acks_sent = set()
+acks_lock = threading.Lock()
 data_lock = threading.Lock()
 finish_event = threading.Event()
 written = 0
@@ -70,8 +71,10 @@ def client_thread(ip, connected_event, new_file_lock):
     def connection_status_changed(available):
         if available:
             available_event.set()
+            logging.debug('available {}'.format(time.time()))
         else:
             available_event.clear()
+            logging.debug('not available {}'.format(time.time()))
 
     heart_beat = heartbeat.Heartbeat(ip, action_handler=connection_status_changed,
                                      identifier='{} hearbeat'.format(ip))
@@ -92,10 +95,14 @@ def client_thread(ip, connected_event, new_file_lock):
         try:
 
             if not available_event.is_set():
+                logging.debug('before wait')
                 available_event.wait()
+                logging.debug('after wait')
 
             if finish_event.is_set():
                 break
+
+            logging.debug('connecting')
 
             client_sock.connect((ip, PORT))
 
@@ -111,7 +118,7 @@ def client_thread(ip, connected_event, new_file_lock):
                     logging.warning('server not present anymore')
                     continue
 
-                logging.debug('send reconnect msg')
+                logging.debug('reconnect msg sent')
 
                 response = __recv_secure(client_sock, 128, available_event)
 
@@ -122,7 +129,6 @@ def client_thread(ip, connected_event, new_file_lock):
                 else:
                     logging.info('error occurred'.format(response))
                     connected_event.set()
-                    finish_event.set()
                     return
             else:
                 with new_file_lock:
@@ -205,15 +211,13 @@ def start_download(sock, available_event):
                 logging.warning('connection error')
                 return
 
-            offset = struct.unpack('>i', buf[0:4])[0]
+            offset = struct.unpack('>I', buf[0:4])[0]
             logging.debug('offset {}'.format(offset))
 
-            if offset in acks_sent:
-                logging.debug('resend acks')
-                acks_sent.remove(offset)
-                continue
-            # print 'buf', buf[:4]
-            # print 'offset', offset
+            if offset > file_info[FileInfoKeys.FileSize]:
+                logging.debug('received strange data! Resync needed, Aborting')
+                return
+
             buf = buf[4:]
             total_len = len(buf)
             msg_len = MSG_LENGTH
@@ -230,6 +234,11 @@ def start_download(sock, available_event):
 
                 total_len = len(buf)
 
+            if offset in acks_sent:
+                with acks_lock:
+                    acks_sent.remove(offset)
+                continue
+
             data[offset] = (buf, total_len)
             logging.debug('received offset {}'.format(offset))
 
@@ -244,9 +253,13 @@ def _send_acks(conn, available_event, stop_event):
         while not stop_event.is_set():
             to_send = set(data.keys()).difference(acks_sent)
             for offset in to_send:
-                if not __send_secure(conn, str(offset), available_event):
+                if not __send_secure(conn, struct.pack('>I', offset), available_event):
                     return
-                acks_sent.add(offset)
+                with acks_lock:
+                    acks_sent.add(offset)
+
+            time.sleep(0.2)
+
     except socket.error:
         logging.exception('')
 

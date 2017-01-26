@@ -40,7 +40,7 @@ def _heartbeat(self):
     logging.debug('start pinging {}'.format(self.remote_host))
     while not self._stop_event.is_set():
         try:
-            packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.2, count=1)
+            packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.5, count=1)
         except socket.error:
             continue
 
@@ -51,11 +51,10 @@ def _heartbeat(self):
 
         if result != self.connected:
             if self._counter >= 1 or self._counter == -1:
-                logging.debug('connetion status {}'.format(result))
                 self.action_handler(result)
                 self.connected = result
                 self._counter = 0
             else:
                 self._counter += 1
 
-            time.sleep(self._min_wait_time)
+        time.sleep(self._min_wait_time)

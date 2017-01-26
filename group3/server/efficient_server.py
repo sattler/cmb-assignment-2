@@ -106,6 +106,7 @@ def server_thread(serv_socket):
 
                 if len(first_msg) == 0:
                     logging.info('{} disconnected'.format(addr))
+                    continue
 
                 logging.debug('received first msg {}'.format(first_msg))
                 time.sleep(0.02)
@@ -241,8 +242,9 @@ def send_file_data(conn, file_info, available_event):
                 file_info[FileInfoKeys.FileObject].seek(send_offset, 0)
                 data_to_send = file_info[FileInfoKeys.FileObject].read(MSG_LENGTH)
 
-            send_length = __send_secure(conn, struct.pack('>i', send_offset) + data_to_send,
+            send_length = __send_secure(conn, struct.pack('>I', send_offset) + data_to_send,
                                         available_event)
+            time.sleep(0.005)
             logging.debug('sent for offset {} length {}'.format(send_offset, send_length))
             if not send_length:
                 with file_infos_lock:
@@ -281,13 +283,18 @@ def send_file_data(conn, file_info, available_event):
 def rec_acks(conn, file_info, available_event, stop_event):
     try:
         while not stop_event.is_set():
-            ack = __recv_secure(conn, 1024, available_event)
+            ack = __recv_secure(conn, 4, available_event)
+
             if not ack:
                 return
 
-            if int(ack) not in file_info[FileInfoKeys.AcknowledgedOffsets]:
+            ack_offset = struct.unpack('>I', ack)
+
+            logging.debug('recv ack {}'.format(ack_offset))
+            if ack_offset not in file_info[FileInfoKeys.AcknowledgedOffsets]:
                 with file_infos_lock:
-                    file_info[FileInfoKeys.AcknowledgedOffsets].append(ack)
+                    file_info[FileInfoKeys.AcknowledgedOffsets].append(ack_offset)
+
     except socket.error:
         logging.exception('')
 
