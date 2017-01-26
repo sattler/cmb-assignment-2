@@ -11,4 +11,4 @@ start a xterm for sta1 and h1 with `xterm sta1/h1`
     - h1: `python -m group3.server.efficient_server`
     - sta1: `python -m group3.client.efficient_client`
     
-The client currently always loads the index.html
+The client currently always loads the `index.html` and the received data is stored in `./downloads`
