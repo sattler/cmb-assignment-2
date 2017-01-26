@@ -173,7 +173,6 @@ def server_thread(serv_socket):
                     if send_length == 0:
                         logging.info('connection aborted')
 
-                    time.sleep(0.05)
                     send_file_data(conn, file_infos[file_id], available_event)
             except socket.error:
                 logging.exception('')
@@ -204,7 +203,8 @@ def send_file_data(conn, file_info, available_event):
     logging.debug('sending data')
     stop_event = threading.Event()
     acknowledge_thred = threading.Thread(target=rec_acks, args=(conn, file_info, available_event,
-                                                                stop_event))
+                                                                stop_event, file_info[FileInfoKeys.FinishEvent]))
+    acknowledge_thred.daemon = True
     acknowledge_thred.start()
 
     try:
@@ -273,6 +273,8 @@ def send_file_data(conn, file_info, available_event):
                 file_info[FileInfoKeys.TransmittedOffsets].append(send_offset)
 
         logging.info('finished sending data')
+        with file_infos_lock:
+            del file_infos[file_info[FileInfoKeys.FileId]]
 
     except socket.error:
         logging.exception('')
@@ -280,20 +282,28 @@ def send_file_data(conn, file_info, available_event):
         stop_event.set()
 
 
-def rec_acks(conn, file_info, available_event, stop_event):
+def rec_acks(conn, file_info, available_event, stop_event, finish_event):
     try:
         while not stop_event.is_set():
-            ack = __recv_secure(conn, 4, available_event)
+            ack = __recv_secure(conn, 64, available_event)
 
             if not ack:
                 return
 
-            ack_offset = struct.unpack('>I', ack)
+            if ClientMsgs.FinishedDownload.value in ack:
+                finish_event.set()
+                return
 
-            logging.debug('recv ack {}'.format(ack_offset))
-            if ack_offset not in file_info[FileInfoKeys.AcknowledgedOffsets]:
-                with file_infos_lock:
-                    file_info[FileInfoKeys.AcknowledgedOffsets].append(ack_offset)
+            if len(ack) % 4 != 0:
+                ack = ack[:(len(ack) // 4)*4]
+
+            ack_offsets = struct.unpack('>{}I'.format(len(ack)/4), ack)
+
+            logging.debug('recv ack {}'.format(ack_offsets))
+            for ack in ack_offsets:
+                if ack not in file_info[FileInfoKeys.AcknowledgedOffsets]:
+                    with file_infos_lock:
+                        file_info[FileInfoKeys.AcknowledgedOffsets].append(ack)
 
     except socket.error:
         logging.exception('')

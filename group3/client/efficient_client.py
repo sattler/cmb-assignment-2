@@ -83,7 +83,7 @@ def client_thread(ip, connected_event, new_file_lock):
 
     while not finish_event.is_set():
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # client_sock.settimeout(SOCKET_TIMEOUT)
+        client_sock.settimeout(SOCKET_TIMEOUT)
 
         # TCP Keep Alive is to slow in recognizing a connection drop so we replaced it
         # client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -176,9 +176,13 @@ def client_thread(ip, connected_event, new_file_lock):
                         # has no
                         # packet loss so it shouldn't be a Problem
                         continue
+
                     start_download(client_sock, available_event)
 
                 if written >= file_info[FileInfoKeys.FileSize]:
+                    while not __send_secure(client_sock, ClientMsgs.FinishedDownload.value, available_event):
+                        if not available_event.is_set():
+                            available_event.wait()
                     logging.info('finished downloading')
 
         except socket.error as error:
@@ -199,6 +203,7 @@ def start_download(sock, available_event):
     stop_event = threading.Event()
     acknowledge_thred = threading.Thread(target=_send_acks, args=(sock, available_event,
                                                                   stop_event))
+    acknowledge_thred.daemon = True
     acknowledge_thred.start()
 
     try:
@@ -212,7 +217,6 @@ def start_download(sock, available_event):
                 return
 
             offset = struct.unpack('>I', buf[0:4])[0]
-            logging.debug('offset {}'.format(offset))
 
             if offset > file_info[FileInfoKeys.FileSize]:
                 logging.debug('received strange data! Resync needed, Aborting')
@@ -240,7 +244,7 @@ def start_download(sock, available_event):
                 continue
 
             data[offset] = (buf, total_len)
-            logging.debug('received offset {}'.format(offset))
+            # logging.debug('received offset {}'.format(offset))
 
     except socket.error:
         logging.exception('')
@@ -252,13 +256,24 @@ def _send_acks(conn, available_event, stop_event):
     try:
         while not stop_event.is_set():
             to_send = set(data.keys()).difference(acks_sent)
+            data_to_send = ""
+            sent_acks = []
             for offset in to_send:
-                if not __send_secure(conn, struct.pack('>I', offset), available_event):
-                    return
-                with acks_lock:
-                    acks_sent.add(offset)
+                data_to_send += struct.pack('>I', offset)
+                sent_acks.append(offset)
 
-            time.sleep(0.2)
+                if len(data_to_send) >= 15 * 4:
+                    if not __send_secure(conn, data_to_send, available_event):
+                        return
+                    data_to_send = ""
+
+                    with acks_lock:
+                        for ack in sent_acks:
+                            acks_sent.add(ack)
+
+                    sent_acks = []
+
+            time.sleep(0.1)
 
     except socket.error:
         logging.exception('')
