@@ -10,6 +10,7 @@ import struct
 import threading
 import multiprocessing
 import time
+import json
 import logging
 
 import group3.heartbeat as heartbeat
@@ -24,12 +25,11 @@ class FileInfoKeys(enum.Enum):
     Data = 'data'
     DataLock = 'data_lock'
     FinishEvent = 'finish_event'
+    Stats = 'stats'
 
 
 def main():
     setup_logger()
-
-    start_time = time.time()
 
     file_name = 'index.html'
 
@@ -42,7 +42,8 @@ def main():
         FileInfoKeys.Data: {},
         FileInfoKeys.DataLock: threading.Lock(),
         FileInfoKeys.FinishEvent: threading.Event(),
-        FileInfoKeys.FileLock: threading.Lock()
+        FileInfoKeys.FileLock: threading.Lock(),
+        FileInfoKeys.Stats: []
     }
 
     connected_event = threading.Event()
@@ -61,7 +62,8 @@ def main():
     fast_thread.join()
     thread_write.join()
 
-    # TODO  measure how long it took
+    with open('client.stats.json', 'w') as stats_file:
+        json.dump(file_info[FileInfoKeys.Stats], stats_file)
 
 
 def setup_logger():
@@ -252,12 +254,13 @@ class ClientThread(threading.Thread):
                 #     continue
 
                 self.file_info[FileInfoKeys.Data][offset] = (buf, total_len)
+                self.file_info[FileInfoKeys.Stats].append((time.time(), offset))
                 logging.debug('received offset {}'.format(offset))
 
                 if len(self.file_info[FileInfoKeys.Data]) * MSG_LENGTH >= \
                         self.file_info[FileInfoKeys.FileSize]:
                     _send_secure(sock, ClientMsgs.FinishedDownload.value, self.available_event)
-                    logging.debug('finished')
+                    logging.info('finished downloading')
                     self.file_info[FileInfoKeys.FinishEvent].set()
 
         except socket.error:
@@ -354,7 +357,7 @@ class WriteThread(threading.Thread):
                 logging.debug('written {}'.format(self.written))
                 if self.written >= self.file_info[FileInfoKeys.FileSize]:
                     self.file.close()
-                    logging.debug('closing file')
+                    logging.info('closing file')
                     return
 
             time.sleep(0.05)

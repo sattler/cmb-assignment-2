@@ -11,6 +11,7 @@ import struct
 import threading
 import multiprocessing
 import time
+import json
 import logging
 
 import group3.heartbeat as heartbeat
@@ -30,6 +31,7 @@ class FileInfoKeys(enum.Enum):
     FileObject = 'file_obj'
     FileLock = 'lock'
     AcknowledgedOffsets = 'acknowledged_offsets'
+    Stats = 'stats'
 
 
 def main():
@@ -65,10 +67,10 @@ def server_process(ip):
     try:
         while True:
             try:
-                logging.info('waiting for connection')
+                logging.debug('waiting for connection')
                 conn, addr = serv_socket.accept()
                 conn.settimeout(SOCKET_TIMEOUT)
-                logging.info('{} connected'.format(addr))
+                logging.debug('{} connected'.format(addr))
 
                 available_event = multiprocessing.Event()
 
@@ -81,7 +83,7 @@ def server_process(ip):
                 first_msg = conn.recv(1024)
 
                 if len(first_msg) == 0:
-                    logging.info('{} disconnected'.format(addr))
+                    logging.debug('{} disconnected'.format(addr))
                     continue
 
                 logging.debug('received first msg {}'.format(first_msg))
@@ -108,7 +110,8 @@ def server_process(ip):
                             FileInfoKeys.TransmittedOffsets: [],
                             FileInfoKeys.FileObject: open(file_path, 'rb', 4096),
                             FileInfoKeys.FileLock: threading.Lock(),
-                            FileInfoKeys.AcknowledgedOffsets: []
+                            FileInfoKeys.AcknowledgedOffsets: [],
+                            FileInfoKeys.Stats: []
                             }
 
                     # Wait timeout so that first ping at least is finished
@@ -162,7 +165,8 @@ def server_process(ip):
 
                     with file_infos_lock:
                         for offset in offsets_to_send:
-                            file_infos[file_id][FileInfoKeys.TransmittedOffsets].remove(offset)
+                            if offset in file_infos[file_id][FileInfoKeys.TransmittedOffsets]:
+                                file_infos[file_id][FileInfoKeys.TransmittedOffsets].remove(offset)
 
                     send_file_data(conn, file_infos[file_id], available_event)
             except socket.error:
@@ -235,9 +239,9 @@ def send_file_data(conn, file_info, available_event):
                 file_info[FileInfoKeys.FileObject].seek(next_to_send, 0)
                 data_to_send = file_info[FileInfoKeys.FileObject].read(MSG_LENGTH)
 
+            time.sleep(0.005)
             send_length = __send_secure(conn, struct.pack('>I', next_to_send) + data_to_send,
                                         available_event)
-            time.sleep(0.005)
             logging.debug('sent for offset {} length {}'.format(next_to_send, send_length))
             if not send_length:
                 with file_infos_lock:
@@ -245,7 +249,7 @@ def send_file_data(conn, file_info, available_event):
                         file_info[FileInfoKeys.FinishEvent].set()
                         file_info[FileInfoKeys.FinishEvent].clear()
 
-                logging.info('connection aborted for offset {}'.format(next_to_send))
+                logging.debug('connection aborted for offset {}'.format(next_to_send))
                 return
 
             if send_length == len(data_to_send) + 4:
@@ -260,6 +264,8 @@ def send_file_data(conn, file_info, available_event):
             next_to_send = get_next_to_send(file_info)
 
         logging.info('finished sending data')
+        with open('server-stats.json', 'w') as stats_file:
+            json.dump(file_info[FileInfoKeys.Stats], stats_file)
         with file_infos_lock:
             del file_infos[file_info[FileInfoKeys.FileId]]
 
@@ -291,6 +297,9 @@ def rec_status_msg(conn, file_info, available_event, stop_event, finish_event):
                 status_msg = status_msg[:(len(status_msg)//4)*4]
 
             missing_offsets = struct.unpack('>{}I'.format(len(status_msg)//4), status_msg)
+
+            cur_time = time.time()
+            file_info[FileInfoKeys.Stats].extend([(cur_time, offset) for offset in missing_offsets])
 
             logging.debug('received missing offsets {}'.format(missing_offsets))
 
