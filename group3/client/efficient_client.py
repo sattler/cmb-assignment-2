@@ -164,7 +164,7 @@ class ClientProcess(multiprocessing.Process):
                         logging.debug('newFile msg response was: {}'.format(response))
 
                         if ServerMsgs.FileErrorMsg.value in response:
-                            logging.error('Aborting! Serverresponse {}'.format(response))
+                            logging.error('Aborting! Server response {}'.format(response))
                             self.file_info[FileInfoKeys.FinishEvent].set()
                             self.connected_event.set()
                             return
