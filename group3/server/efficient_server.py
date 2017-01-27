@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-Our client implementation
+Our server implementation
 """
 
 import hashlib
