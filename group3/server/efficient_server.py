@@ -239,7 +239,6 @@ def send_file_data(conn, file_info, available_event):
                 file_info[FileInfoKeys.FileObject].seek(next_to_send, 0)
                 data_to_send = file_info[FileInfoKeys.FileObject].read(MSG_LENGTH)
 
-            time.sleep(0.005)
             send_length = __send_secure(conn, struct.pack('>I', next_to_send) + data_to_send,
                                         available_event)
             logging.debug('sent for offset {} length {}'.format(next_to_send, send_length))
