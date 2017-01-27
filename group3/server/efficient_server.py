@@ -57,7 +57,7 @@ def setup_logger():
 def server_process(ip):
     logging.info('starting')
 
-    serv_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    serv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     serv_socket.bind((ip, PORT))
     serv_socket.listen(1)
 
@@ -132,12 +132,12 @@ def server_process(ip):
                         continue
 
                 elif ClientMsgs.Reconnect.value in first_msg:
-                    logging.debug('first msg is reconnect msg')
-
-                    _, file_id, offsets_size = first_msg.split(',')
+                    _, file_id, offsets_size_packed = first_msg.split(',')
                     file_id = file_id.strip()
 
-                    offsets_size = struct.unpack('>I', offsets_size)
+                    offsets_size = struct.unpack('>I', offsets_size_packed)[0]
+
+                    logging.debug('reconnect {} {}'.format(file_id, offsets_size))
 
                     if file_id not in file_infos or \
                             file_infos[file_id][FileInfoKeys.FinishEvent].is_set():
@@ -211,7 +211,10 @@ def get_next_to_send(file_info):
 def remove_offsets(offsets, file_info):
     with file_infos_lock:
         for offset in offsets:
-            file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
+            if offset in file_info[FileInfoKeys.TransmittedOffsets]:
+                file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
+            else:
+                logging.debug('{} not transmitted'.format(offset))
 
 
 def send_file_data(conn, file_info, available_event):
@@ -227,7 +230,8 @@ def send_file_data(conn, file_info, available_event):
             if not available_event.is_set():
                 return
 
-            if not next_to_send:
+            logging.debug('next to send {}'.format(next_to_send))
+            if next_to_send is None:
                 file_info[FileInfoKeys.FinishEvent].wait()
                 next_to_send = get_next_to_send(file_info)
                 continue
@@ -272,7 +276,7 @@ def send_file_data(conn, file_info, available_event):
 
 def rec_status_msg(conn, file_info, available_event, stop_event, finish_event):
     time.sleep(0.2)
-    logging.debug('starting status updates {}'.format(time.time()))
+    logging.debug('starting status updates {} {}'.format(time.time(), available_event.is_set()))
     try:
         while not stop_event.is_set():
             status_msg = __recv_secure(conn, 400, available_event)
@@ -285,6 +289,9 @@ def rec_status_msg(conn, file_info, available_event, stop_event, finish_event):
                 finish_event.set()
                 return
 
+            if status_msg == ClientMsgs.NoMissing.value:
+                status_msg = ''
+
             if len(status_msg) % 4 != 0:
                 status_msg = status_msg[:(len(status_msg)//4)*4]
 
@@ -292,7 +299,8 @@ def rec_status_msg(conn, file_info, available_event, stop_event, finish_event):
 
             logging.debug('received missing offsets {}'.format(missing_offsets))
 
-            remove_offsets(missing_offsets, file_info)
+            if missing_offsets:
+                remove_offsets(missing_offsets, file_info)
 
             if len(missing_offsets) < 100:
                 time.sleep(1)

@@ -31,12 +31,7 @@ class FileInfoKeys(enum.Enum):
 
 
 file_name = 'index.html'
-
-
-def main():
-    setup_logger()
-
-    file_info = {
+file_info = {
         FileInfoKeys.FileName: file_name, FileInfoKeys.Data: {},
         FileInfoKeys.DataLock: multiprocessing.Lock(), FileInfoKeys.AcksSent: set(),
         FileInfoKeys.AcksSentLock: multiprocessing.Lock(),
@@ -46,15 +41,19 @@ def main():
         FileInfoKeys.FileLock: multiprocessing.Lock()
     }
 
+
+def main():
+    setup_logger()
+
     try:
         start_time = time.time()
 
-        connected_event = threading.Event()
+        connected_event = multiprocessing.Event()
 
-        fast_thread = ClientProcess(SERVER_IP_FAST, file_info, connected_event, name='fast')
-        slow_thread = ClientProcess(SERVER_IP_SLOW, file_info, connected_event, name='slow')
+        fast_thread = ClientProcess(SERVER_IP_FAST, connected_event, name='fast')
+        slow_thread = ClientProcess(SERVER_IP_SLOW, connected_event, name='slow')
 
-        thread_write = WriteThread(file_info, name='write thread')
+        thread_write = WriteThread(name='write thread')
 
         thread_write.start()
         slow_thread.start()
@@ -77,9 +76,8 @@ def setup_logger():
 
 class ClientProcess(multiprocessing.Process):
 
-    def __init__(self, ip, file_info, connected_event, **kwargs):
+    def __init__(self, ip, connected_event, **kwargs):
         self.ip = ip
-        self.file_info = file_info
         self.connected_event = connected_event
         self.available_event = threading.Event()
 
@@ -91,8 +89,8 @@ class ClientProcess(multiprocessing.Process):
 
         heart_beat.start()
 
-        while not self.file_info[FileInfoKeys.FinishEvent].is_set():
-            client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while not file_info[FileInfoKeys.FinishEvent].is_set():
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             client_sock.settimeout(CLIENT_SOCKET_TIMEOUT)
 
             try:
@@ -102,7 +100,7 @@ class ClientProcess(multiprocessing.Process):
                     self.available_event.wait()
                     logging.debug('after wait')
 
-                if self.file_info[FileInfoKeys.FinishEvent].is_set():
+                if file_info[FileInfoKeys.FinishEvent].is_set():
                     break
 
                 logging.debug('connecting')
@@ -111,11 +109,11 @@ class ClientProcess(multiprocessing.Process):
 
                 logging.debug('after connect')
 
-                if FileInfoKeys.FileId in self.file_info:
-                    not_received = all_offsets_left(self.file_info)
+                if FileInfoKeys.FileId in file_info:
+                    not_received = all_offsets_left(file_info)
 
                     reconnect_msg = ClientMsgs.Reconnect.value + ',' + \
-                                    self.file_info[FileInfoKeys.FileId] + ',' + \
+                                    file_info[FileInfoKeys.FileId] + ',' + \
                                     struct.pack('>I', len(not_received))
                     send_length = _send_secure(client_sock, reconnect_msg, self.available_event)
 
@@ -141,14 +139,14 @@ class ClientProcess(multiprocessing.Process):
                     logging.debug('reconnected')
                     self.start_download(client_sock)
                 else:
-                    with self.file_info[FileInfoKeys.FileLock]:
-                        if FileInfoKeys.FileId in self.file_info:
+                    with file_info[FileInfoKeys.FileLock]:
+                        if FileInfoKeys.FileId in file_info:
                             continue
 
                         logging.debug('send newFile msg')
 
                         send_length = _send_secure(client_sock, ClientMsgs.NewFile.value + ',' +
-                                                   self.file_info[FileInfoKeys.FileName],
+                                                   file_info[FileInfoKeys.FileName],
                                                    self.available_event)
 
                         if send_length == 0:
@@ -165,15 +163,15 @@ class ClientProcess(multiprocessing.Process):
 
                         if ServerMsgs.FileErrorMsg.value in response:
                             logging.error('Aborting! Server response {}'.format(response))
-                            self.file_info[FileInfoKeys.FinishEvent].set()
+                            file_info[FileInfoKeys.FinishEvent].set()
                             self.connected_event.set()
                             return
 
                         file_size, file_id = response.split(',')
-                        self.file_info[FileInfoKeys.FileId] = file_id
-                        self.file_info[FileInfoKeys.FileSize] = int(file_size)
+                        file_info[FileInfoKeys.FileId] = file_id
+                        file_info[FileInfoKeys.FileSize] = int(file_size)
                         logging.info('connected {} {}'.format(
-                            file_id, self.file_info[FileInfoKeys.FileSize]))
+                            file_id, file_info[FileInfoKeys.FileSize]))
 
                         self.connected_event.set()
 
@@ -190,8 +188,8 @@ class ClientProcess(multiprocessing.Process):
 
                         self.start_download(client_sock)
 
-                    if self.file_info[FileInfoKeys.Written] >= \
-                            self.file_info[FileInfoKeys.FileSize]:
+                    if file_info[FileInfoKeys.Written] >= \
+                            file_info[FileInfoKeys.FileSize]:
                         _send_secure(client_sock, ClientMsgs.FinishedDownload.value,
                                      self.available_event)
                         logging.info('finished downloading')
@@ -200,7 +198,7 @@ class ClientProcess(multiprocessing.Process):
                 if error.errno == 111:
                     logging.exception('server not started! Aborting...')
                     print('server not started! Aborting')
-                    self.file_info[FileInfoKeys.FinishEvent].set()
+                    file_info[FileInfoKeys.FinishEvent].set()
                     break
                 logging.exception('client socket error')
             finally:
@@ -212,11 +210,11 @@ class ClientProcess(multiprocessing.Process):
         logging.debug('downloading')
         stop_event = threading.Event()
 
-        acknowledge_thred = StatusThread(sock, self.available_event, self.file_info, stop_event)
+        acknowledge_thred = StatusThread(sock, self.available_event, stop_event)
         acknowledge_thred.start()
 
         try:
-            while not self.file_info[FileInfoKeys.FinishEvent].is_set():
+            while not file_info[FileInfoKeys.FinishEvent].is_set():
                 if not self.available_event.is_set():
                     return
                 buf = _recv_secure(sock, MSG_LENGTH + 4, self.available_event)
@@ -227,7 +225,7 @@ class ClientProcess(multiprocessing.Process):
 
                 offset = struct.unpack('>I', buf[0:4])[0]
 
-                if offset > self.file_info[FileInfoKeys.FileSize]:
+                if offset > file_info[FileInfoKeys.FileSize]:
                     logging.debug('received strange data! Resync needed, Aborting')
                     return
 
@@ -235,8 +233,8 @@ class ClientProcess(multiprocessing.Process):
                 total_len = len(buf)
                 msg_len = MSG_LENGTH
 
-                if offset + MSG_LENGTH > self.file_info[FileInfoKeys.FileSize]:
-                    msg_len = int(self.file_info[FileInfoKeys.FileSize]) - offset
+                if offset + MSG_LENGTH > file_info[FileInfoKeys.FileSize]:
+                    msg_len = int(file_info[FileInfoKeys.FileSize]) - offset
 
                 while total_len != msg_len:
                     buf += _recv_secure(sock, MSG_LENGTH - total_len, self.available_event)
@@ -247,13 +245,17 @@ class ClientProcess(multiprocessing.Process):
 
                     total_len = len(buf)
 
-                # if offset in self.file_info[FileInfoKeys.AcksSent]:
-                #     with self.file_info[FileInfoKeys.AcksSentLock]:
-                #         self.file_info[FileInfoKeys.AcksSent].remove(offset)
+                # if offset in file_info[FileInfoKeys.AcksSent]:
+                #     with file_info[FileInfoKeys.AcksSentLock]:
+                #         file_info[FileInfoKeys.AcksSent].remove(offset)
                 #     continue
 
-                self.file_info[FileInfoKeys.Data][offset] = (buf, total_len)
-                # logging.debug('received offset {}'.format(offset))
+                file_info[FileInfoKeys.Data][offset] = (buf, total_len)
+                logging.debug('received offset {}'.format(offset))
+
+                if len(file_info[FileInfoKeys.Data]) * MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
+                    _send_secure(sock, ClientMsgs.FinishedDownload.value, self.available_event)
+                    file_info[FileInfoKeys.FinishEvent].set()
 
         except socket.error:
             logging.exception('')
@@ -276,24 +278,29 @@ def all_offsets_left(file_info):
 
 class StatusThread(threading.Thread):
 
-    def __init__(self, conn, available_event, file_info, stop_event, **kwargs):
+    def __init__(self, conn, available_event, stop_event, **kwargs):
         self.conn = conn
         self.available_event = available_event
-        self.file_info = file_info
         self.stop_event = stop_event
         super(StatusThread, self).__init__(**kwargs)
 
     def run(self):
-        logging.debug('starting status updates {}'.format(time.time()))
+        logging.debug('starting status updates {} {}'.format(time.time(), self.available_event.is_set()))
         try:
             while not self.stop_event.is_set():
-                offsets_left = all_offsets_left(self.file_info)[:100]
-                send_number = _send_secure(self.conn,
-                                           struct.pack('>{}I'.format(len(offsets_left)),
-                                                       *offsets_left),
-                                           self.available_event)
+                offsets_left = all_offsets_left(file_info)[:100]
+                logging.debug('sending {}'.format(time.time(), self.available_event.is_set()))
+
+                if offsets_left:
+                    msg = struct.pack('>{}I'.format(len(offsets_left)), *offsets_left)
+                else:
+                    msg = ClientMsgs.NoMissing.value
+
+                send_number = _send_secure(self.conn, msg, self.available_event)
+
                 if send_number == 0:
                     logging.debug('socket disconnected')
+                    return
 
                 if len(offsets_left) < 100:
                     time.sleep(1)
@@ -317,30 +324,26 @@ def _send_secure(sock, data_to_send, available_event):
 
 class WriteThread(threading.Thread):
 
-    def __init__(self, file_info, **kwargs):
-        self.file_info = file_info
-        super(WriteThread, self).__init__(**kwargs)
-
     def run(self):
         while True:
-            if self.file_info[FileInfoKeys.Written] in self.file_info[FileInfoKeys.Data]:
-                while self.file_info[FileInfoKeys.Written] < \
-                        int(self.file_info[FileInfoKeys.FileSize]):
-                    write_len = self.file_info[FileInfoKeys.Data][
-                        self.file_info[FileInfoKeys.Written]][1]
-                    self.file_info[FileInfoKeys.FileObj].write(
-                        self.file_info[FileInfoKeys.Data][self.file_info[FileInfoKeys.Written]][0])
+            if file_info[FileInfoKeys.Written] in file_info[FileInfoKeys.Data]:
+                while file_info[FileInfoKeys.Written] < \
+                        int(file_info[FileInfoKeys.FileSize]):
+                    write_len = file_info[FileInfoKeys.Data][
+                        file_info[FileInfoKeys.Written]][1]
+                    file_info[FileInfoKeys.FileObj].write(
+                        file_info[FileInfoKeys.Data][file_info[FileInfoKeys.Written]][0])
 
                     # with data_lock:
                     #     del data[written]
 
-                    self.file_info[FileInfoKeys.Written] += write_len
-                    if self.file_info[FileInfoKeys.Written] not in \
-                            self.file_info[FileInfoKeys.Data]:
+                    file_info[FileInfoKeys.Written] += write_len
+                    if file_info[FileInfoKeys.Written] not in \
+                            file_info[FileInfoKeys.Data]:
                         break
-                logging.debug('written {}'.format(self.file_info[FileInfoKeys.Written]))
-                if self.file_info[FileInfoKeys.Written] >= self.file_info[FileInfoKeys.FileSize]:
-                    self.file_info[FileInfoKeys.FinishEvent].set()
+                logging.debug('written {}'.format(file_info[FileInfoKeys.Written]))
+                if file_info[FileInfoKeys.Written] >= file_info[FileInfoKeys.FileSize]:
+                    file_info[FileInfoKeys.FinishEvent].set()
                     return
 
             time.sleep(0.05)
