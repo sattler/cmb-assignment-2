@@ -10,13 +10,14 @@ import socket
 import struct
 import threading
 import time
+import multiprocessing
 import logging
 
 import group3.heartbeat as heartbeat
 from group3.constants import *
 
 file_infos = {}
-file_infos_lock = threading.Lock()
+file_infos_lock = multiprocessing.Lock()
 
 
 class FileInfoKeys(enum.Enum):
@@ -34,51 +35,32 @@ class FileInfoKeys(enum.Enum):
 def main():
     setup_logger()
 
-    server_sock_fast = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock_fast.bind((SERVER_IP_FAST, PORT))
-    server_sock_fast.listen(1)
+    process_fast = multiprocessing.Process(target=server_process, args=(SERVER_IP_FAST,),
+                                          name='fast thread')
+    process_slow = multiprocessing.Process(target=server_process, args=(SERVER_IP_SLOW,),
+                                          name='slow thread')
 
-    server_sock_slow = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock_slow.bind((SERVER_IP_SLOW, PORT))
-    server_sock_slow.listen(1)
+    process_fast.start()
+    process_slow.start()
 
-    # TCP Keep Alive is to slow in recognizing a connection drop so we replaced it
-    # server_sock_fast.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    # # Options specific for linux
-    # server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEP_ALIVE_IDLE)
-    # server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,
-    # TCP_KEEP_ALIVE_INTERVALL)
-    # server_sock_fast.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEP_ALIVE_MAX_FAILS)
-    #
-    # server_sock_slow.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    # # Options specific for linux
-    # server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEP_ALIVE_IDLE)
-    # server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL,
-    # TCP_KEEP_ALIVE_INTERVALL)
-    # server_sock_slow.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEP_ALIVE_MAX_FAILS)
-
-    thread_fast = threading.Thread(target=server_thread, args=(server_sock_fast,),
-                                   name='fast thread')
-    thread_slow = threading.Thread(target=server_thread, args=(server_sock_slow,),
-                                   name='slow thread')
-
-    thread_fast.start()
-    thread_slow.start()
-
-    thread_fast.join()
-    thread_slow.join()
+    process_fast.join()
+    process_slow.join()
     logging.info('terminated')
 
 
 def setup_logger():
     logging.basicConfig(filename='server.log', level=LOGGING,
-                        format=u'[%(asctime)s][%(levelname)-s][%(threadName)s] '
+                        format=u'[%(asctime)s][%(levelname)-s][%(processName)s] '
                                u'%(filename)s:%(lineno)d %(message)s',
                         datefmt='%d.%m %H:%M:%S')
 
 
-def server_thread(serv_socket):
+def server_process(ip):
     logging.info('starting')
+
+    serv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serv_socket.bind((ip, PORT))
+    serv_socket.listen(1)
 
     try:
         while True:
@@ -91,7 +73,7 @@ def server_thread(serv_socket):
                 available_event = threading.Event()
 
                 heart_beat = heartbeat.Heartbeat(addr[0], available_event=available_event,
-                                                 identifier='{} hearbeat'.format(addr[0]),
+                                                 identifier='{} heartbeat'.format(addr[0]),
                                                  min_wait_time=0.02)
 
                 heart_beat.start()
@@ -198,7 +180,8 @@ def send_file_data(conn, file_info, available_event):
     logging.debug('sending data')
     stop_event = threading.Event()
     acknowledge_thred = threading.Thread(target=rec_acks, args=(
-        conn.getsockname()[0], file_info, available_event, stop_event, file_info[FileInfoKeys.FinishEvent]))
+        conn.getsockname()[0], file_info, available_event, stop_event,
+        file_info[FileInfoKeys.FinishEvent]))
     acknowledge_thred.start()
 
     try:
@@ -209,9 +192,11 @@ def send_file_data(conn, file_info, available_event):
 
             if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
                     file_info[FileInfoKeys.FileSize] or file_info[FileInfoKeys.NextToSend] < 0:
-                to_send = set(file_info[FileInfoKeys.TransmittedOffsets]).difference(
-                    file_info[FileInfoKeys.AcknowledgedOffsets])
+
                 with file_infos_lock:
+                    to_send = set(file_info[FileInfoKeys.TransmittedOffsets]).difference(
+                        file_info[FileInfoKeys.AcknowledgedOffsets])
+
                     for offset in to_send:
                         file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
 
@@ -286,18 +271,18 @@ def send_file_data(conn, file_info, available_event):
 
 
 def rec_acks(ip, file_info, available_event, stop_event, finish_event):
+    logging.debug('start receiving acks for {}'.format(ip))
     while not stop_event.is_set():
+        conn = None
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
             sock.bind((ip, ACKS_PORT))
             sock.listen(1)
 
             conn, addr = sock.accept()
+            conn.settimeout(2)
 
             while not stop_event.is_set():
-
-
                 ack = __recv_secure(conn, 64, available_event)
 
                 if not ack:
@@ -319,10 +304,14 @@ def rec_acks(ip, file_info, available_event, stop_event, finish_event):
                             file_info[FileInfoKeys.AcknowledgedOffsets].append(ack)
 
         except socket.error:
+
             logging.exception('')
         finally:
-            conn.close()
+            if conn:
+                conn.close()
             sock.close()
+
+    logging.debug('stop receiving acks for {}'.format(ip))
 
 
 if __name__ == '__main__':

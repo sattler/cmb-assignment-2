@@ -8,6 +8,7 @@ import os
 import socket
 import struct
 import threading
+import multiprocessing
 import time
 import logging
 
@@ -37,11 +38,11 @@ def main():
 
     file_info = {
         FileInfoKeys.FileName: file_name, FileInfoKeys.Data: {},
-        FileInfoKeys.DataLock: threading.Lock(), FileInfoKeys.AcksSent: set(),
-        FileInfoKeys.AcksSentLock: threading.Lock(), FileInfoKeys.FinishEvent: threading.Event(),
+        FileInfoKeys.DataLock: multiprocessing.Lock(), FileInfoKeys.AcksSent: set(),
+        FileInfoKeys.AcksSentLock: multiprocessing.Lock(), FileInfoKeys.FinishEvent: multiprocessing.Event(),
         FileInfoKeys.Written: 0,
         FileInfoKeys.FileObj: open(os.path.join('downloads', file_name), 'wb'),
-        FileInfoKeys.FileLock: threading.Lock()
+        FileInfoKeys.FileLock: multiprocessing.Lock()
     }
 
     try:
@@ -49,8 +50,8 @@ def main():
 
         connected_event = threading.Event()
 
-        fast_thread = ClientThread(SERVER_IP_FAST, file_info, connected_event, name='fast')
-        slow_thread = ClientThread(SERVER_IP_SLOW, file_info, connected_event, name='slow')
+        fast_thread = ClientProcess(SERVER_IP_FAST, file_info, connected_event, name='fast')
+        slow_thread = ClientProcess(SERVER_IP_SLOW, file_info, connected_event, name='slow')
 
         thread_write = WriteThread(file_info, name='write thread')
 
@@ -68,12 +69,12 @@ def main():
 
 def setup_logger():
     logging.basicConfig(filename='client.log', level=LOGGING,
-                        format=u'[%(asctime)s][%(levelname)-s][%(threadName)s] '
+                        format=u'[%(asctime)s][%(levelname)-s][%(processName)s] '
                                u'%(filename)s:%(lineno)d %(message)s',
                         datefmt='%d.%m %H:%M:%S')
 
 
-class ClientThread(threading.Thread):
+class ClientProcess(multiprocessing.Process):
 
     def __init__(self, ip, file_info, connected_event, **kwargs):
         self.ip = ip
@@ -81,7 +82,7 @@ class ClientThread(threading.Thread):
         self.connected_event = connected_event
         self.available_event = threading.Event()
 
-        super(ClientThread, self).__init__(**kwargs)
+        super(ClientProcess, self).__init__(**kwargs)
 
     def run(self):
         heart_beat = heartbeat.Heartbeat(self.ip, available_event=self.available_event,
@@ -188,7 +189,7 @@ class ClientThread(threading.Thread):
                         logging.info('finished downloading')
 
             except socket.error as error:
-                if '111' in error.message:
+                if error.errno == 111:
                     logging.exception('server not started! Aborting...')
                     print('server not started! Aborting')
                     self.file_info[FileInfoKeys.FinishEvent].set()
