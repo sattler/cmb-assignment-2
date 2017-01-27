@@ -193,13 +193,9 @@ def __send_secure(sock, data, available_event):
 def get_next_to_send(file_info):
     if not file_info[FileInfoKeys.TransmittedOffsets]:
         return 0
-    next_offset = None
+    next_offset = 0
     while next_offset in file_info[FileInfoKeys.TransmittedOffsets]:
         next_offset += MSG_LENGTH
-
-    if next_offset is None:
-        logging.error('error server stuck\n{}'.format(file_info[FileInfoKeys.TransmittedOffsets]))
-        raise ValueError('no next offset')
 
     if next_offset < file_info[FileInfoKeys.FileSize]:
         return next_offset
