@@ -39,7 +39,8 @@ def main():
     file_info = {
         FileInfoKeys.FileName: file_name, FileInfoKeys.Data: {},
         FileInfoKeys.DataLock: multiprocessing.Lock(), FileInfoKeys.AcksSent: set(),
-        FileInfoKeys.AcksSentLock: multiprocessing.Lock(), FileInfoKeys.FinishEvent: multiprocessing.Event(),
+        FileInfoKeys.AcksSentLock: multiprocessing.Lock(),
+        FileInfoKeys.FinishEvent: multiprocessing.Event(),
         FileInfoKeys.Written: 0,
         FileInfoKeys.FileObj: open(os.path.join('downloads', file_name), 'wb'),
         FileInfoKeys.FileLock: multiprocessing.Lock()
@@ -91,7 +92,7 @@ class ClientProcess(multiprocessing.Process):
         heart_beat.start()
 
         while not self.file_info[FileInfoKeys.FinishEvent].is_set():
-            client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             client_sock.settimeout(CLIENT_SOCKET_TIMEOUT)
 
             try:
@@ -111,10 +112,12 @@ class ClientProcess(multiprocessing.Process):
                 logging.debug('after connect')
 
                 if FileInfoKeys.FileId in self.file_info:
-                    send_length = _send_secure(client_sock,
-                                               ClientMsgs.Reconnect.value + ',' +
-                                               self.file_info[FileInfoKeys.FileId],
-                                               self.available_event)
+                    not_received = all_offsets_left(self.file_info)
+
+                    reconnect_msg = ClientMsgs.Reconnect.value + ',' + \
+                                    self.file_info[FileInfoKeys.FileId] + ',' + \
+                                    struct.pack('>I', len(not_received))
+                    send_length = _send_secure(client_sock, reconnect_msg, self.available_event)
 
                     if send_length == 0:
                         logging.warning('server not present anymore')
@@ -124,14 +127,19 @@ class ClientProcess(multiprocessing.Process):
 
                     response = _recv_secure(client_sock, 128, self.available_event)
 
-                    if ServerMsgs.Acknowledge.value in response:
-                        logging.debug('reconnected')
-                        self.connected_event.set()
-                        self.start_download(client_sock)
-                    else:
+                    if ServerMsgs.Acknowledge.value not in response:
                         logging.info('error occurred'.format(response))
-                        self.connected_event.set()
                         return
+
+                    send_length = _send_secure(client_sock, struct.pack(
+                        '>{}I'.format(len(not_received)), *not_received), self.available_event)
+
+                    if send_length == 0:
+                        logging.warning('server not present anymore')
+                        continue
+
+                    logging.debug('reconnected')
+                    self.start_download(client_sock)
                 else:
                     with self.file_info[FileInfoKeys.FileLock]:
                         if FileInfoKeys.FileId in self.file_info:
@@ -204,7 +212,7 @@ class ClientProcess(multiprocessing.Process):
         logging.debug('downloading')
         stop_event = threading.Event()
 
-        acknowledge_thred = AcksThread(sock.getpeername()[0], self.available_event, self.file_info, stop_event)
+        acknowledge_thred = StatusThread(sock, self.available_event, self.file_info, stop_event)
         acknowledge_thred.start()
 
         try:
@@ -239,10 +247,10 @@ class ClientProcess(multiprocessing.Process):
 
                     total_len = len(buf)
 
-                if offset in self.file_info[FileInfoKeys.AcksSent]:
-                    with self.file_info[FileInfoKeys.AcksSentLock]:
-                        self.file_info[FileInfoKeys.AcksSent].remove(offset)
-                    continue
+                # if offset in self.file_info[FileInfoKeys.AcksSent]:
+                #     with self.file_info[FileInfoKeys.AcksSentLock]:
+                #         self.file_info[FileInfoKeys.AcksSent].remove(offset)
+                #     continue
 
                 self.file_info[FileInfoKeys.Data][offset] = (buf, total_len)
                 # logging.debug('received offset {}'.format(offset))
@@ -253,47 +261,44 @@ class ClientProcess(multiprocessing.Process):
             stop_event.set()
 
 
-class AcksThread(threading.Thread):
+def all_offsets_left(file_info):
+    if len(file_info[FileInfoKeys.Data]):
+        offsets = list(file_info[FileInfoKeys.Data].keys())
+        left_offsets = []
+        for offset in xrange(0, max(offsets), MSG_LENGTH):
+            if offset not in offsets:
+                left_offsets.append(offset)
 
-    def __init__(self, ip, available_event, file_info, stop_event, **kwargs):
-        self.ip = ip
+        left_offsets.append(max(offsets) + MSG_LENGTH)
+        return left_offsets
+    return []
+
+
+class StatusThread(threading.Thread):
+
+    def __init__(self, conn, available_event, file_info, stop_event, **kwargs):
+        self.conn = conn
         self.available_event = available_event
         self.file_info = file_info
         self.stop_event = stop_event
-        super(AcksThread, self).__init__(**kwargs)
+        super(StatusThread, self).__init__(**kwargs)
 
-    def _send_acks(self):
-        while not self.stop_event.is_set():
-            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    def run(self):
+        logging.debug('starting status updates {}'.format(time.time()))
+        try:
+            while not self.stop_event.is_set():
+                offsets_left = all_offsets_left(self.file_info)[:100]
+                send_number = _send_secure(self.conn,
+                                           struct.pack('>{}I'.format(len(offsets_left)),
+                                                       *offsets_left),
+                                           self.available_event)
+                if send_number == 0:
+                    logging.debug('socket disconnected')
 
-            conn.connect((self.ip, ACKS_PORT))
-            try:
-                while not self.stop_event.is_set():
-                    to_send = set(self.file_info[FileInfoKeys.Data].keys()).difference(
-                        self.file_info[FileInfoKeys.AcksSent])
-                    data_to_send = ""
-                    sent_acks = []
-                    for offset in to_send:
-                        data_to_send += struct.pack('>I', offset)
-                        sent_acks.append(offset)
-
-                        if len(data_to_send) >= 15 * 4:
-                            if not _send_secure(conn, data_to_send, self.available_event):
-                                return
-                            data_to_send = ""
-
-                            with self.file_info[FileInfoKeys.AcksSentLock]:
-                                for ack in sent_acks:
-                                    self.file_info[FileInfoKeys.AcksSent].add(ack)
-
-                            sent_acks = []
-
-                    time.sleep(0.1)
-
-            except socket.error:
-                logging.exception('')
-            finally:
-                conn.close()
+                if len(offsets_left) < 100:
+                    time.sleep(1)
+        except socket.error:
+            logging.exception('')
 
 
 def _recv_secure(sock, number_bytes, available_event):

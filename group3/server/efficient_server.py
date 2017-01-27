@@ -25,7 +25,6 @@ class FileInfoKeys(enum.Enum):
     FileName = 'file_name'
     FileSize = 'file_size'
     FinishEvent = 'finish_event'
-    NextToSend = 'next_to_send'
     TransmittedOffsets = 'offsets_trans'
     FileObject = 'file_obj'
     FileLock = 'lock'
@@ -36,9 +35,9 @@ def main():
     setup_logger()
 
     process_fast = multiprocessing.Process(target=server_process, args=(SERVER_IP_FAST,),
-                                          name='fast thread')
+                                           name='fast thread')
     process_slow = multiprocessing.Process(target=server_process, args=(SERVER_IP_SLOW,),
-                                          name='slow thread')
+                                           name='slow thread')
 
     process_fast.start()
     process_slow.start()
@@ -58,7 +57,7 @@ def setup_logger():
 def server_process(ip):
     logging.info('starting')
 
-    serv_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serv_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     serv_socket.bind((ip, PORT))
     serv_socket.listen(1)
 
@@ -105,7 +104,6 @@ def server_process(ip):
                             FileInfoKeys.FileName: file_path,
                             FileInfoKeys.FileSize: file_size,
                             FileInfoKeys.FinishEvent: threading.Event(),
-                            FileInfoKeys.NextToSend: 0,
                             FileInfoKeys.TransmittedOffsets: [],
                             FileInfoKeys.FileObject: open(file_path, 'rb', 4096),
                             FileInfoKeys.FileLock: threading.Lock(),
@@ -136,8 +134,10 @@ def server_process(ip):
                 elif ClientMsgs.Reconnect.value in first_msg:
                     logging.debug('first msg is reconnect msg')
 
-                    _, file_id = first_msg.split(',')
+                    _, file_id, offsets_size = first_msg.split(',')
                     file_id = file_id.strip()
+
+                    offsets_size = struct.unpack('>I', offsets_size)
 
                     if file_id not in file_infos or \
                             file_infos[file_id][FileInfoKeys.FinishEvent].is_set():
@@ -150,6 +150,19 @@ def server_process(ip):
                         logging.info('connection aborted')
 
                     time.sleep(0.02)
+                    offsets_to_send_packed = __recv_secure(conn, offsets_size*4, available_event)
+
+                    if len(offsets_to_send_packed) == 0:
+                        logging.info('{} disconnected in reconnect'.format(addr))
+                        continue
+
+                    offsets_to_send = struct.unpack('>{}I'.format(offsets_size),
+                                                    offsets_to_send_packed)
+
+                    with file_infos_lock:
+                        for offset in offsets_to_send:
+                            file_infos[file_id][FileInfoKeys.TransmittedOffsets].remove(offset)
+
                     send_file_data(conn, file_infos[file_id], available_event)
             except socket.error:
                 logging.exception('')
@@ -176,89 +189,76 @@ def __send_secure(sock, data, available_event):
     return None
 
 
+def get_next_to_send(file_info):
+    if not file_info[FileInfoKeys.TransmittedOffsets]:
+        return 0
+    next_offset = None
+    for offset in xrange(0, max(file_info[FileInfoKeys.TransmittedOffsets]) + MSG_LENGTH + 1, MSG_LENGTH):
+        if offset not in file_info[FileInfoKeys.TransmittedOffsets]:
+            next_offset = offset
+            break
+
+    if next_offset is None:
+        logging.error('error server stuck\n{}'.format(file_info[FileInfoKeys.TransmittedOffsets]))
+        raise ValueError('no next offset')
+
+    if next_offset < file_info[FileInfoKeys.FileSize]:
+        return next_offset
+
+    return None
+
+
+def remove_offsets(offsets, file_info):
+    with file_infos_lock:
+        for offset in offsets:
+            file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
+
+
 def send_file_data(conn, file_info, available_event):
     logging.debug('sending data')
     stop_event = threading.Event()
-    acknowledge_thred = threading.Thread(target=rec_acks, args=(
-        conn.getsockname()[0], file_info, available_event, stop_event,
-        file_info[FileInfoKeys.FinishEvent]))
-    acknowledge_thred.start()
+    status_thread = threading.Thread(target=rec_status_msg, args=(
+        conn, file_info, available_event, stop_event, file_info[FileInfoKeys.FinishEvent]))
+    status_thread.start()
 
     try:
-        while file_info[FileInfoKeys.NextToSend] >= 0 or not \
-                file_info[FileInfoKeys.FinishEvent].is_set():
+        next_to_send = get_next_to_send(file_info)
+        while not file_info[FileInfoKeys.FinishEvent].is_set():
             if not available_event.is_set():
                 return
 
-            if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
-                    file_info[FileInfoKeys.FileSize] or file_info[FileInfoKeys.NextToSend] < 0:
-
-                with file_infos_lock:
-                    to_send = set(file_info[FileInfoKeys.TransmittedOffsets]).difference(
-                        file_info[FileInfoKeys.AcknowledgedOffsets])
-
-                    for offset in to_send:
-                        file_info[FileInfoKeys.TransmittedOffsets].remove(offset)
-
-                if len(to_send) > 0:
-                    file_info[FileInfoKeys.NextToSend] = min(to_send)
-                else:
-                    file_info[FileInfoKeys.NextToSend] = -1
-
-            if file_info[FileInfoKeys.NextToSend] < 0:
+            if not next_to_send:
                 file_info[FileInfoKeys.FinishEvent].wait()
+                next_to_send = get_next_to_send(file_info)
                 continue
-
-            with file_infos_lock:
-                send_offset = file_info[FileInfoKeys.NextToSend]
-
-                if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
-                        file_info[FileInfoKeys.FileSize]:
-                    file_info[FileInfoKeys.NextToSend] = -1
-                else:
-                    file_info[FileInfoKeys.NextToSend] += MSG_LENGTH
-
-                while file_info[FileInfoKeys.NextToSend] in \
-                        file_info[FileInfoKeys.TransmittedOffsets]:
-                    if file_info[FileInfoKeys.NextToSend] + MSG_LENGTH >= \
-                            file_info[FileInfoKeys.FileSize]:
-                        file_info[FileInfoKeys.NextToSend] = -1
-                    else:
-                        file_info[FileInfoKeys.NextToSend] += MSG_LENGTH
 
             with file_info[FileInfoKeys.FileLock]:
-                file_info[FileInfoKeys.FileObject].seek(send_offset, 0)
+                file_info[FileInfoKeys.FileObject].seek(next_to_send, 0)
                 data_to_send = file_info[FileInfoKeys.FileObject].read(MSG_LENGTH)
 
-            send_length = __send_secure(conn, struct.pack('>I', send_offset) + data_to_send,
+            send_length = __send_secure(conn, struct.pack('>I', next_to_send) + data_to_send,
                                         available_event)
             time.sleep(0.005)
-            logging.debug('sent for offset {} length {}'.format(send_offset, send_length))
+            logging.debug('sent for offset {} length {}'.format(next_to_send, send_length))
             if not send_length:
                 with file_infos_lock:
-                    if send_offset + MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
+                    if next_to_send + MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
                         file_info[FileInfoKeys.FinishEvent].set()
                         file_info[FileInfoKeys.FinishEvent].clear()
-                    file_info[FileInfoKeys.NextToSend] = send_offset
 
-                logging.info('connection aborted for offset {}'.format(send_offset))
+                logging.info('connection aborted for offset {}'.format(next_to_send))
                 return
 
-            if send_length < len(data_to_send) + 4:
+            if send_length == len(data_to_send) + 4:
                 with file_infos_lock:
-                    if send_offset + MSG_LENGTH >= file_info[FileInfoKeys.FileSize]:
-                        file_info[FileInfoKeys.FinishEvent].set()
-                        file_info[FileInfoKeys.FinishEvent].clear()
-                    file_info[FileInfoKeys.NextToSend] = send_offset
+                    file_info[FileInfoKeys.TransmittedOffsets].append(next_to_send)
 
-                continue
+                if send_length + next_to_send >= file_info[FileInfoKeys.FileSize] and \
+                        len(file_info[FileInfoKeys.TransmittedOffsets]) * MSG_LENGTH >= \
+                        file_info[FileInfoKeys.FileSize]:
+                    file_info[FileInfoKeys.FinishEvent].wait()
 
-            if send_length + send_offset >= file_info[FileInfoKeys.FileSize] and \
-                    file_info[FileInfoKeys.NextToSend] < 0:
-                file_info[FileInfoKeys.FinishEvent].set()
-
-            with file_infos_lock:
-                file_info[FileInfoKeys.TransmittedOffsets].append(send_offset)
+            next_to_send = get_next_to_send(file_info)
 
         logging.info('finished sending data')
         with file_infos_lock:
@@ -270,48 +270,35 @@ def send_file_data(conn, file_info, available_event):
         stop_event.set()
 
 
-def rec_acks(ip, file_info, available_event, stop_event, finish_event):
-    logging.debug('start receiving acks for {}'.format(ip))
-    while not stop_event.is_set():
-        conn = None
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.bind((ip, ACKS_PORT))
-            sock.listen(1)
+def rec_status_msg(conn, file_info, available_event, stop_event, finish_event):
+    time.sleep(0.2)
+    logging.debug('starting status updates {}'.format(time.time()))
+    try:
+        while not stop_event.is_set():
+            status_msg = __recv_secure(conn, 400, available_event)
 
-            conn, addr = sock.accept()
-            conn.settimeout(2)
+            if len(status_msg) == 0:
+                logging.debug('connection broke in status thread')
+                return
 
-            while not stop_event.is_set():
-                ack = __recv_secure(conn, 64, available_event)
+            if status_msg == ClientMsgs.FinishedDownload.value:
+                finish_event.set()
+                return
 
-                if not ack:
-                    return
+            if len(status_msg) % 4 != 0:
+                status_msg = status_msg[:(len(status_msg)//4)*4]
 
-                if ClientMsgs.FinishedDownload.value in ack:
-                    finish_event.set()
-                    return
+            missing_offsets = struct.unpack('>{}I'.format(len(status_msg)//4), status_msg)
 
-                if len(ack) % 4 != 0:
-                    ack = ack[:(len(ack) // 4)*4]
+            logging.debug('received missing offsets {}'.format(missing_offsets))
 
-                ack_offsets = struct.unpack('>{}I'.format(len(ack)/4), ack)
+            remove_offsets(missing_offsets, file_info)
 
-                logging.debug('recv ack {}'.format(ack_offsets))
-                for ack in ack_offsets:
-                    if ack not in file_info[FileInfoKeys.AcknowledgedOffsets]:
-                        with file_infos_lock:
-                            file_info[FileInfoKeys.AcknowledgedOffsets].append(ack)
+            if len(missing_offsets) < 100:
+                time.sleep(1)
 
-        except socket.error:
-
-            logging.exception('')
-        finally:
-            if conn:
-                conn.close()
-            sock.close()
-
-    logging.debug('stop receiving acks for {}'.format(ip))
+    except socket.error:
+        logging.exception('')
 
 
 if __name__ == '__main__':

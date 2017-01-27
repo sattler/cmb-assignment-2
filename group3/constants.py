@@ -24,5 +24,5 @@ class ServerMsgs(enum.Enum):
 class ClientMsgs(enum.Enum):
     NewFile = 'NewFile'
     StartDownload = 'StartDownload'
-    Reconnect = 'Reconnect;'
+    Reconnect = 'Reconnect'
     FinishedDownload = 'F;'
