@@ -9,15 +9,15 @@ import os
 import socket
 import struct
 import threading
-import time
 import multiprocessing
+import time
 import logging
 
 import group3.heartbeat as heartbeat
 from group3.constants import *
 
 file_infos = {}
-file_infos_lock = multiprocessing.Lock()
+file_infos_lock = threading.Lock()
 
 
 class FileInfoKeys(enum.Enum):
@@ -26,6 +26,7 @@ class FileInfoKeys(enum.Enum):
     FileSize = 'file_size'
     FinishEvent = 'finish_event'
     TransmittedOffsets = 'offsets_trans'
+    TransmittedOffsetsLock = 'offset_lock'
     FileObject = 'file_obj'
     FileLock = 'lock'
     AcknowledgedOffsets = 'acknowledged_offsets'
@@ -34,10 +35,10 @@ class FileInfoKeys(enum.Enum):
 def main():
     setup_logger()
 
-    process_fast = multiprocessing.Process(target=server_process, args=(SERVER_IP_FAST,),
-                                           name='fast thread')
-    process_slow = multiprocessing.Process(target=server_process, args=(SERVER_IP_SLOW,),
-                                           name='slow thread')
+    process_fast = threading.Thread(target=server_process, args=(SERVER_IP_FAST,),
+                                    name='fast thread')
+    process_slow = threading.Thread(target=server_process, args=(SERVER_IP_SLOW,),
+                                    name='slow thread')
 
     process_fast.start()
     process_slow.start()
@@ -69,7 +70,7 @@ def server_process(ip):
                 conn.settimeout(SOCKET_TIMEOUT)
                 logging.info('{} connected'.format(addr))
 
-                available_event = threading.Event()
+                available_event = multiprocessing.Event()
 
                 heart_beat = heartbeat.Heartbeat(addr[0], available_event=available_event,
                                                  identifier='{} heartbeat'.format(addr[0]),
@@ -167,7 +168,7 @@ def server_process(ip):
             except socket.error:
                 logging.exception('')
             finally:
-                heart_beat.stop()
+                heart_beat.terminate()
                 conn.close()
 
     finally:
@@ -193,10 +194,8 @@ def get_next_to_send(file_info):
     if not file_info[FileInfoKeys.TransmittedOffsets]:
         return 0
     next_offset = None
-    for offset in xrange(0, max(file_info[FileInfoKeys.TransmittedOffsets]) + MSG_LENGTH + 1, MSG_LENGTH):
-        if offset not in file_info[FileInfoKeys.TransmittedOffsets]:
-            next_offset = offset
-            break
+    while next_offset in file_info[FileInfoKeys.TransmittedOffsets]:
+        next_offset += MSG_LENGTH
 
     if next_offset is None:
         logging.error('error server stuck\n{}'.format(file_info[FileInfoKeys.TransmittedOffsets]))

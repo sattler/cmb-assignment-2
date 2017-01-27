@@ -2,12 +2,13 @@
 
 import logging
 import threading
+import multiprocessing
 import time
 import ping
 import socket
 
 
-class Heartbeat(threading.Thread):
+class Heartbeat(multiprocessing.Process):
     """test the remote host with heartbeat requests"""
 
     def __init__(self, remote_host, available_event, identifier=None, min_wait_time=0.2):
@@ -18,42 +19,41 @@ class Heartbeat(threading.Thread):
         self.remote_host = remote_host
         self.available_event = available_event
         self._counter = -1
-        self._stop_event = threading.Event()
         self._min_wait_time = min_wait_time
         super(Heartbeat, self).__init__(name=identifier)
-
-    def stop(self):
-        """Stops the heartbeat"""
-        self._stop_event.set()
 
 
     def run(self):
         logging.debug('start pinging {}'.format(self.remote_host))
-        while not self._stop_event.is_set():
-            try:
-                packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.25, count=1)
-            except socket.error:
-                logging.debug('dump error')
-                continue
+        try:
+            while True:
+                try:
+                    packets_lost, _, _ = ping.quiet_ping(self.remote_host, timeout=0.25, count=1)
+                except socket.error:
+                    logging.debug('dumb error')
+                    continue
 
-            result = True
+                result = True
 
-            if packets_lost:
-                result = False
+                if packets_lost:
+                    result = False
 
-            if result != self.available_event.is_set():
-                if self._counter >= 2 or self._counter == -1:
-                    if result:
-                        logging.debug('available')
-                        self.available_event.set()
+                if result != self.available_event.is_set():
+                    if self._counter >= 2 or self._counter == -1:
+                        if result:
+                            logging.debug('available')
+                            self.available_event.set()
+                        else:
+                            logging.debug('not available')
+                            self.available_event.clear()
+
+                        self._counter = 0
                     else:
-                        logging.debug('not available')
-                        self.available_event.clear()
-
-                    self._counter = 0
+                        self._counter += 1
                 else:
-                    self._counter += 1
-            else:
-                self._counter = 0
+                    self._counter = 0
 
-            time.sleep(self._min_wait_time)
+                time.sleep(self._min_wait_time)
+        except:
+            logging.debug('terminated')
+
